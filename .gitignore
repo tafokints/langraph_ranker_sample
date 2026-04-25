@@ -1,0 +1,40 @@
+# --- Secrets / env ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+build/
+dist/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Streamlit local state ---
+.streamlit/secrets.toml
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Cursor project-local artifacts we do not want in git ---
+.cursor/plans/
+.cursor/agent-transcripts/
+.cursor/projects/
+
+# --- Notebooks / logs ---
+*.ipynb_checkpoints/
+*.log
