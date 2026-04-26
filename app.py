@@ -7,7 +7,8 @@ from typing import Any, Dict, List
 
 import streamlit as st
 
-from src.langgraph_app import run_recruiter_search
+from src.labels_store import count_labels, save_label
+from src.langgraph_app import DIMENSION_KEYS, run_recruiter_search
 
 APP_TITLE = "LangGraph Recruiter Agent"
 APP_SUBTITLE = "Query natural language -> LangGraph pipeline over 1k LinkedIn profiles"
@@ -17,6 +18,21 @@ MIN_TOP_K = 3
 MAX_TOP_K = 15
 MAX_MIN_EXPERIENCE = 15
 ABOUT_PREVIEW_CHARS = 500
+
+DIMENSION_DISPLAY_ORDER = (
+    ("technical_background", "Technical", 0.30),
+    ("founder_experience", "Founder", 0.25),
+    ("phd_researcher", "PhD / Research", 0.15),
+    ("education_prestige", "Education", 0.15),
+    ("sf_location_fit", "SF fit", 0.15),
+)
+RUBRIC_HELP = (
+    "Overall score = weighted aggregate of 5 dimensions. "
+    "Weights are loaded from config/weights.json (fit by scripts/calibrate.py) "
+    "or the hardcoded defaults if that file is missing."
+)
+DEFAULT_LABELER_NAME = "me"
+SCORE_SLIDER_STEP = 0.5
 
 ARCHITECTURE_MERMAID = """
 ```mermaid
@@ -69,6 +85,24 @@ def _render_sidebar() -> Dict[str, Any]:
         run_button = st.button("Run recruiter agent", type="primary")
 
         st.divider()
+        st.subheader("Calibration")
+        labeler_name = st.text_input(
+            "Labeler",
+            value=DEFAULT_LABELER_NAME,
+            help="Your name/handle; attached to every rating you save.",
+        )
+        total_labels_collected = count_labels()
+        labels_by_user = count_labels(labeler=labeler_name) if labeler_name.strip() else 0
+        st.caption(
+            f"Labels collected: **{total_labels_collected}** total"
+            f" · **{labels_by_user}** by `{labeler_name or '-'}`"
+        )
+        st.caption(
+            "Rate candidates below to teach the rubric what 'good' looks like; "
+            "then run `python scripts/calibrate.py` to refit the weights."
+        )
+
+        st.divider()
         st.subheader("Architecture")
         st.markdown(ARCHITECTURE_MERMAID)
         st.caption("Prototype retrieval: lexical SQL filter + LLM ranking. Not production RAG.")
@@ -77,6 +111,7 @@ def _render_sidebar() -> Dict[str, Any]:
         "query_text": query_text,
         "top_k": int(top_k_value),
         "min_experience": int(min_experience_value),
+        "labeler": labeler_name.strip() or DEFAULT_LABELER_NAME,
         "run_button": run_button,
     }
 
@@ -94,8 +129,102 @@ def _truncate_about_for_ui(about_text: str) -> str:
     return about_text[:ABOUT_PREVIEW_CHARS].rstrip() + "..."
 
 
-def _render_candidate_cards(ranked_candidates: List[Dict[str, Any]]) -> None:
+def _render_rating_form(candidate: Dict[str, Any], labeler_name: str) -> None:
+    """Collapsed per-candidate rating form (5 per-dim + 1 overall + note).
+
+    Sliders default to the system's current scores so the labeler can override
+    only the dimensions they disagree with. All widget keys are namespaced by
+    profile_id so multiple cards on the page don't collide.
+    """
+    profile_id_value = str(candidate.get("profile_id", "")).strip()
+    if not profile_id_value:
+        return
+
+    heuristic_dimension_scores = candidate.get("dimension_scores") or {}
+    heuristic_overall_score = float(candidate.get("rank_score") or 5.0)
+
+    with st.expander("Rate this candidate"):
+        st.caption(
+            "Score each dimension 0-10 as a non-technical reviewer would; "
+            "then score the overall fit. Defaults are the system's current scores."
+        )
+
+        rating_columns = st.columns(len(DIMENSION_DISPLAY_ORDER))
+        submitted_dimension_scores: Dict[str, float] = {}
+        for rating_column, (dimension_key, dimension_label, _weight) in zip(
+            rating_columns, DIMENSION_DISPLAY_ORDER
+        ):
+            try:
+                default_value = float(heuristic_dimension_scores.get(dimension_key, 5.0) or 5.0)
+            except (TypeError, ValueError):
+                default_value = 5.0
+            default_value = max(0.0, min(10.0, default_value))
+            submitted_dimension_scores[dimension_key] = rating_column.slider(
+                dimension_label,
+                min_value=0.0,
+                max_value=10.0,
+                value=default_value,
+                step=SCORE_SLIDER_STEP,
+                key=f"rate_{profile_id_value}_{dimension_key}",
+            )
+
+        overall_input_value = st.slider(
+            "Overall fit",
+            min_value=0.0,
+            max_value=10.0,
+            value=max(0.0, min(10.0, heuristic_overall_score)),
+            step=SCORE_SLIDER_STEP,
+            key=f"rate_{profile_id_value}_overall",
+        )
+        note_input_value = st.text_input(
+            "Note (optional)",
+            key=f"rate_{profile_id_value}_note",
+            help="Short free-text context, e.g. 'strong founder signal from YC W21'.",
+        )
+        save_clicked = st.button(
+            "Save rating",
+            key=f"rate_{profile_id_value}_save",
+            type="secondary",
+        )
+
+        if save_clicked:
+            try:
+                save_label(
+                    profile_id=profile_id_value,
+                    labeler=labeler_name,
+                    dim_scores=submitted_dimension_scores,
+                    overall_score=float(overall_input_value),
+                    note=note_input_value,
+                    required_dimension_keys=list(DIMENSION_KEYS),
+                )
+                st.success(f"Saved rating for {profile_id_value} (labeler: {labeler_name}).")
+            except Exception as save_error:  # noqa: BLE001 - show DB / validation errors inline
+                st.error(f"Failed to save rating: {save_error}")
+
+
+def _render_dimension_breakdown(candidate: Dict[str, Any]) -> None:
+    dimension_scores = candidate.get("dimension_scores") or {}
+    dimension_reasons = candidate.get("dimension_reasons") or {}
+    breakdown_columns = st.columns(len(DIMENSION_DISPLAY_ORDER))
+    for column, (dimension_key, dimension_label, dimension_weight) in zip(
+        breakdown_columns, DIMENSION_DISPLAY_ORDER
+    ):
+        raw_value = dimension_scores.get(dimension_key, 0.0) or 0.0
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_value = 0.0
+        clamped_value = max(0.0, min(10.0, numeric_value))
+        column.markdown(f"**{dimension_label}**  \n<sub>w={int(dimension_weight * 100)}%</sub>", unsafe_allow_html=True)
+        column.progress(clamped_value / 10.0, text=f"{clamped_value:.1f}/10")
+        reason_text = dimension_reasons.get(dimension_key, "")
+        if reason_text:
+            column.caption(reason_text)
+
+
+def _render_candidate_cards(ranked_candidates: List[Dict[str, Any]], labeler_name: str) -> None:
     st.subheader(f"Ranked candidates ({len(ranked_candidates)})")
+    st.caption(RUBRIC_HELP)
     if not ranked_candidates:
         st.info("No candidates returned for the current filters.")
         return
@@ -113,12 +242,15 @@ def _render_candidate_cards(ranked_candidates: List[Dict[str, Any]]) -> None:
                 if subtitle_bits:
                     st.caption(" | ".join(subtitle_bits))
             with header_columns[1]:
-                st.metric("Score", f"{rank_score}/10")
+                st.metric("Score", f"{rank_score}/10", help=RUBRIC_HELP)
 
-            chip_columns = st.columns(3)
-            chip_columns[0].markdown(f"Skills: **{candidate.get('skills_count', 0)}**")
-            chip_columns[1].markdown(f"Experience: **{candidate.get('experience_count', 0)}**")
-            chip_columns[2].markdown(f"Education: **{candidate.get('education_count', 0)}**")
+            _render_dimension_breakdown(candidate)
+
+            st.caption(
+                f"{candidate.get('skills_count', 0)} skills"
+                f" · {candidate.get('experience_count', 0)} experience"
+                f" · {candidate.get('education_count', 0)} education"
+            )
 
             match_reasons = candidate.get("match_reasons") or []
             if match_reasons:
@@ -136,6 +268,8 @@ def _render_candidate_cards(ranked_candidates: List[Dict[str, Any]]) -> None:
             if about_preview:
                 with st.expander("About (preview)"):
                     st.write(about_preview)
+
+            _render_rating_form(candidate, labeler_name)
 
             st.caption(f"Source: `{candidate.get('profile_id', '')}`")
 
@@ -190,7 +324,7 @@ def main() -> None:
     with top_columns[1]:
         _render_shortlist(result.get("shortlist_summary", ""))
 
-    _render_candidate_cards(result.get("ranked_candidates", []))
+    _render_candidate_cards(result.get("ranked_candidates", []), sidebar_values["labeler"])
     _render_errors(result.get("error_messages", []))
 
     with st.expander("Raw result JSON (debug)"):

@@ -16,6 +16,21 @@ class ParsedQuery(TypedDict):
     nice_to_have_keywords: List[str]
 
 
+class DimensionBreakdown(TypedDict):
+    """Per-dimension sub-scores (0-10) that aggregate into rank_score.
+
+    The five dimensions target an SF-based startup founding/early-team lens:
+    research depth, location fit, technical strength, education rigor, and
+    prior founder/executive experience.
+    """
+
+    phd_researcher: float
+    sf_location_fit: float
+    technical_background: float
+    education_prestige: float
+    founder_experience: float
+
+
 class RankedCandidate(TypedDict):
     """A candidate enriched with LLM or deterministic ranking output."""
 
@@ -31,6 +46,8 @@ class RankedCandidate(TypedDict):
     rank_score: float
     match_reasons: List[str]
     risks: List[str]
+    dimension_scores: DimensionBreakdown
+    dimension_reasons: Dict[str, str]
 
 
 class RecruiterGraphState(TypedDict, total=False):

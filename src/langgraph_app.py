@@ -9,15 +9,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from . import weights_loader
 from .retriever import search_profiles
 from .schemas import (
     DEFAULT_PARSED_QUERY,
+    DimensionBreakdown,
     ParsedQuery,
     RankedCandidate,
     RecruiterGraphState,
@@ -27,6 +29,109 @@ DEFAULT_MODEL_NAME = "gpt-4o-mini"
 MAX_ABOUT_PREVIEW_CHARS = 1400
 MAX_RANKING_CANDIDATES = 12
 FALLBACK_RANK_SCORE = 5.0
+
+DIMENSION_KEYS = (
+    "phd_researcher",
+    "sf_location_fit",
+    "technical_background",
+    "education_prestige",
+    "founder_experience",
+)
+
+DIMENSION_LABELS: Dict[str, str] = {
+    "phd_researcher": "PhD / Researcher",
+    "sf_location_fit": "SF location fit",
+    "technical_background": "Technical background",
+    "education_prestige": "Education prestige",
+    "founder_experience": "Founder experience",
+}
+
+DEFAULT_DIMENSION_WEIGHTS: Dict[str, float] = {
+    "technical_background": 0.30,
+    "founder_experience": 0.25,
+    "phd_researcher": 0.15,
+    "education_prestige": 0.15,
+    "sf_location_fit": 0.15,
+}
+
+# Resolved at import time: reads `config/weights.json` if present and valid,
+# otherwise falls back to DEFAULT_DIMENSION_WEIGHTS. Callers that need the
+# baseline (e.g. the calibrator) can still reach DEFAULT_DIMENSION_WEIGHTS.
+DIMENSION_WEIGHTS: Dict[str, float] = weights_loader.load_weights(DEFAULT_DIMENSION_WEIGHTS)
+
+HIGH_WEIGHT_RISK_THRESHOLD = 0.20
+LOW_SCORE_RISK_THRESHOLD = 2.0
+STRONG_DIMENSION_THRESHOLD = 4.0
+
+SF_BAY_LOCATION_TOKENS = (
+    "san francisco", "sf bay", "bay area", "south bay", "east bay", "peninsula",
+    "palo alto", "mountain view", "menlo park", "sunnyvale", "oakland", "berkeley",
+    "san mateo", "redwood city", "cupertino", "san jose", "daly city", "foster city",
+)
+CA_TECH_TOKENS = (
+    "california", ", ca", " ca,", " ca ", "ca usa",
+    "los angeles", "san diego", "sacramento", "santa monica", "irvine",
+)
+US_TECH_HUB_TOKENS = (
+    "new york", "nyc", ", ny", "seattle", "austin", "boston", "denver", "chicago",
+    "washington, d.c.", "washington dc", "atlanta", "portland, or",
+)
+US_GENERIC_TOKENS = ("united states", "usa", "u.s.", "remote")
+
+PHD_TITLE_TOKENS = ("phd", "ph.d", "ph. d", "doctor of philosophy", "doctorate", "d.phil")
+RESEARCH_TITLE_TOKENS = (
+    "research scientist", "research engineer", "research fellow", "postdoc",
+    "post-doctoral", "post doctoral", "principal investigator", "phd candidate",
+    "phd student", "doctoral candidate", "doctoral student",
+)
+PUBLICATION_VENUE_TOKENS = (
+    "arxiv", "neurips", "icml", "cvpr", "acl", "emnlp", "iclr", "kdd",
+    "published in", "publication", "co-authored", "ieee ", " acm ", "nature ",
+)
+
+FOUNDER_TITLE_TOKENS = (
+    "founder", "co-founder", "cofounder", "founding engineer", "founding member",
+    "founding team", "ceo", "cto", "chief executive", "chief technology",
+    "chief operating", "coo ",
+)
+FOUNDER_CONTEXT_TOKENS = (
+    "y combinator", " yc ", "techstars", "seed round", "series a", "series b",
+    "raised $", "raised seed", "acquired by", "acquihire", "exited",
+    "bootstrapped", "startup i founded", "startup i co-founded",
+)
+
+TECHNICAL_TITLE_TOKENS = (
+    "software engineer", "software developer", "backend engineer", "frontend engineer",
+    "full stack", "fullstack", "data scientist", "ml engineer", "machine learning",
+    "applied scientist", "research engineer", "research scientist", "staff engineer",
+    "principal engineer", "distinguished engineer", "devops", "sre ",
+    "site reliability", "platform engineer", "infrastructure engineer",
+    "artificial intelligence",
+)
+TECHNICAL_SKILL_TOKENS = (
+    "python", "pytorch", "tensorflow", "jax", "kubernetes", " aws ", " gcp ",
+    " azure ", "c++", "rust", "golang", "java ", "scala", "sql", "react", "node.js",
+    "node ", "spark", " llm", " nlp", " cv ", "computer vision", "transformer",
+    "typescript",
+)
+
+TOP_SCHOOL_TOKENS = (
+    "stanford", "mit ", "massachusetts institute", "harvard", "princeton", "yale",
+    "uc berkeley", "u.c. berkeley", "berkeley", "caltech", "carnegie mellon", "cmu ",
+    "cornell", "columbia university", "university of chicago", "upenn",
+    "university of pennsylvania", "johns hopkins", "oxford", "cambridge",
+    "eth zurich", "eth zürich", "imperial college london", "tsinghua",
+    "peking university", "iit ", "indian institute of technology",
+)
+STRONG_SCHOOL_TOKENS = (
+    "university of california", "ucla", "ucsd", "ucsb", "georgia tech",
+    "university of washington", "university of michigan", "ut austin",
+    "university of texas", "uiuc", "illinois urbana", "purdue", "duke",
+    "northwestern", "nyu ", "university of southern california", "usc ",
+    "university of toronto", "mcgill", "waterloo",
+)
+MASTERS_DEGREE_TOKENS = ("master of", "master's", "masters", "m.s.", "m.sc", "msc ", "m.eng")
+BACHELORS_DEGREE_TOKENS = ("bachelor of", "bachelor's", "bachelors", "b.s.", "b.sc", "bsc ", "b.eng", "undergrad")
 
 
 def _load_environment() -> None:
@@ -193,24 +298,206 @@ def _truncate_about(about_text: str) -> str:
     return about_text[:MAX_ABOUT_PREVIEW_CHARS].rstrip() + "..."
 
 
+def _combined_profile_text(profile: Dict[str, Any]) -> str:
+    """Lowercased concatenation of fields used for keyword-based signal detection."""
+    text_parts = [
+        str(profile.get("headline") or ""),
+        str(profile.get("about_text") or ""),
+        str(profile.get("experience_json") or ""),
+        str(profile.get("education_json") or ""),
+    ]
+    return " \n ".join(part.lower() for part in text_parts if part)
+
+
+def _any_token_present(haystack: str, tokens: Sequence[str]) -> bool:
+    return any(token in haystack for token in tokens)
+
+
+def _count_tokens_present(haystack: str, tokens: Sequence[str]) -> int:
+    return sum(1 for token in tokens if token in haystack)
+
+
+def _clip_score(value: float) -> float:
+    return max(0.0, min(10.0, float(value)))
+
+
+def _score_phd_researcher(profile: Dict[str, Any]) -> tuple:
+    combined = _combined_profile_text(profile)
+    score = 0.0
+    reasons: List[str] = []
+
+    if _any_token_present(combined, PHD_TITLE_TOKENS):
+        score += 7.0
+        reasons.append("PhD/doctorate mentioned")
+    research_hits = _count_tokens_present(combined, RESEARCH_TITLE_TOKENS)
+    if research_hits:
+        score += min(2.0, research_hits * 1.0)
+        reasons.append(f"{research_hits} research role/title signal(s)")
+    publication_hits = _count_tokens_present(combined, PUBLICATION_VENUE_TOKENS)
+    if publication_hits:
+        score += min(2.0, publication_hits * 0.6)
+        reasons.append(f"{publication_hits} publication/venue signal(s)")
+
+    return _clip_score(score), "; ".join(reasons) or "no PhD/research signal found"
+
+
+def _score_sf_location_fit(profile: Dict[str, Any]) -> tuple:
+    raw_location = (profile.get("location") or "").strip()
+    location_lower = raw_location.lower()
+    about_lower = (profile.get("about_text") or "").lower()
+
+    if _any_token_present(location_lower, SF_BAY_LOCATION_TOKENS):
+        return 10.0, f"SF/Bay Area location: '{raw_location}'"
+    if _any_token_present(location_lower, CA_TECH_TOKENS):
+        return 7.0, f"California tech region: '{raw_location}'"
+    if _any_token_present(location_lower, US_TECH_HUB_TOKENS):
+        return 5.0, f"US tech hub: '{raw_location}'"
+    if _any_token_present(location_lower, US_GENERIC_TOKENS) or _any_token_present(about_lower, ("remote (us)", "based in the us")):
+        return 4.0, f"US/remote: '{raw_location}'"
+    if raw_location:
+        return 2.0, f"Out-of-market: '{raw_location}'"
+    return 1.0, "no location data"
+
+
+def _score_technical_background(profile: Dict[str, Any]) -> tuple:
+    combined = _combined_profile_text(profile)
+    skills_count_value = int(profile.get("skills_count") or 0)
+    score = 0.0
+    reasons: List[str] = []
+
+    title_hits = _count_tokens_present(combined, TECHNICAL_TITLE_TOKENS)
+    skill_hits = _count_tokens_present(combined, TECHNICAL_SKILL_TOKENS)
+
+    if title_hits:
+        score += min(5.0, title_hits * 1.25)
+        reasons.append(f"{title_hits} technical title hit(s)")
+    if skill_hits:
+        score += min(4.0, skill_hits * 0.8)
+        reasons.append(f"{skill_hits} technical stack hit(s)")
+    if skills_count_value >= 20:
+        score += 1.0
+        reasons.append(f"{skills_count_value} listed skills")
+    elif skills_count_value >= 10:
+        score += 0.5
+
+    return _clip_score(score), "; ".join(reasons) or "no technical signal found"
+
+
+def _score_education_prestige(profile: Dict[str, Any]) -> tuple:
+    education_blob = (profile.get("education_json") or "").lower()
+    about_blob = (profile.get("about_text") or "").lower()
+    combined = education_blob + " \n " + about_blob
+    education_count_value = int(profile.get("education_count") or 0)
+
+    score = 0.0
+    reasons: List[str] = []
+
+    if _any_token_present(combined, TOP_SCHOOL_TOKENS):
+        score += 7.0
+        reasons.append("top-tier school match")
+    elif _any_token_present(combined, STRONG_SCHOOL_TOKENS):
+        score += 5.0
+        reasons.append("strong school match")
+
+    if _any_token_present(combined, PHD_TITLE_TOKENS):
+        score += 2.0
+        reasons.append("doctoral degree")
+    elif _any_token_present(combined, MASTERS_DEGREE_TOKENS):
+        score += 1.5
+        reasons.append("master's degree")
+    elif _any_token_present(combined, BACHELORS_DEGREE_TOKENS):
+        score += 0.5
+        reasons.append("bachelor's degree")
+
+    if score == 0.0 and education_count_value > 0:
+        score = 2.0
+        reasons.append(f"{education_count_value} education entry(ies), no prestige match")
+
+    return _clip_score(score), "; ".join(reasons) or "no education data"
+
+
+def _score_founder_experience(profile: Dict[str, Any]) -> tuple:
+    combined = _combined_profile_text(profile)
+    score = 0.0
+    reasons: List[str] = []
+
+    title_hits = _count_tokens_present(combined, FOUNDER_TITLE_TOKENS)
+    context_hits = _count_tokens_present(combined, FOUNDER_CONTEXT_TOKENS)
+
+    if title_hits:
+        score += min(7.0, title_hits * 2.5)
+        reasons.append(f"{title_hits} founder/exec title hit(s)")
+    if context_hits:
+        score += min(3.0, context_hits * 1.0)
+        reasons.append(f"{context_hits} startup context signal(s)")
+
+    return _clip_score(score), "; ".join(reasons) or "no founder signal found"
+
+
+_DIMENSION_SCORERS = (
+    ("phd_researcher", _score_phd_researcher),
+    ("sf_location_fit", _score_sf_location_fit),
+    ("technical_background", _score_technical_background),
+    ("education_prestige", _score_education_prestige),
+    ("founder_experience", _score_founder_experience),
+)
+
+
+def _compute_dimension_scores(profile: Dict[str, Any]) -> tuple:
+    """Compute all 5 sub-scores + short evidence reason per dimension."""
+    dim_scores: Dict[str, float] = {}
+    dim_reasons: Dict[str, str] = {}
+    for dimension_key, scorer in _DIMENSION_SCORERS:
+        score_value, reason_text = scorer(profile)
+        dim_scores[dimension_key] = round(float(score_value), 2)
+        dim_reasons[dimension_key] = reason_text
+    assert set(dim_scores.keys()) == set(DIMENSION_KEYS), "dimension scores must cover all DIMENSION_KEYS"
+    return dim_scores, dim_reasons
+
+
+def _aggregate_rank_score(dimension_scores: Dict[str, float]) -> float:
+    """Weighted aggregate of the 5 sub-scores, clipped to [0, 10]."""
+    total_weighted = 0.0
+    for dimension_key, weight in DIMENSION_WEIGHTS.items():
+        total_weighted += float(dimension_scores.get(dimension_key, 0.0)) * weight
+    return round(_clip_score(total_weighted), 2)
+
+
 def _deterministic_rank(profile: Dict[str, Any]) -> RankedCandidate:
+    """Baseline ranking built entirely from structured signals (no LLM).
+
+    Computes the 5 dimension sub-scores, aggregates them using DIMENSION_WEIGHTS,
+    and surfaces strong dimensions as match_reasons and weak high-weight dimensions
+    as risks. Also serves as the fallback when the LLM path fails.
+    """
     relevance_value = int(profile.get("relevance_score") or 0)
     experience_value = int(profile.get("experience_count") or 0)
     skills_value = int(profile.get("skills_count") or 0)
+    education_value = int(profile.get("education_count") or 0)
 
-    normalized_score = min(10.0, (relevance_value * 1.0) + (experience_value * 0.25) + (skills_value * 0.05))
-    if normalized_score <= 0:
-        normalized_score = FALLBACK_RANK_SCORE
+    dim_scores, dim_reasons = _compute_dimension_scores(profile)
+    overall_score = _aggregate_rank_score(dim_scores)
 
-    reasons = []
-    if relevance_value > 0:
-        reasons.append(f"Keyword relevance score {relevance_value}.")
-    if experience_value > 0:
-        reasons.append(f"{experience_value} experience entries.")
-    if skills_value > 0:
-        reasons.append(f"{skills_value} listed skills.")
-    if not reasons:
-        reasons.append("Baseline match; no structured signals found.")
+    match_reasons: List[str] = [
+        f"{DIMENSION_LABELS[key]}: {dim_scores[key]}/10 - {dim_reasons[key]}"
+        for key in DIMENSION_KEYS
+        if dim_scores[key] >= STRONG_DIMENSION_THRESHOLD
+    ]
+    if not match_reasons:
+        match_reasons = [
+            f"{DIMENSION_LABELS[key]}: {dim_scores[key]}/10"
+            for key in DIMENSION_KEYS
+        ]
+
+    risks: List[str] = [
+        f"Low {DIMENSION_LABELS[key]} ({dim_scores[key]}/10)"
+        for key in DIMENSION_KEYS
+        if dim_scores[key] <= LOW_SCORE_RISK_THRESHOLD
+        and DIMENSION_WEIGHTS[key] >= HIGH_WEIGHT_RISK_THRESHOLD
+    ]
+
+    if overall_score <= 0:
+        overall_score = FALLBACK_RANK_SCORE
 
     return {
         "profile_id": profile.get("profile_id", ""),
@@ -220,12 +507,61 @@ def _deterministic_rank(profile: Dict[str, Any]) -> RankedCandidate:
         "about_text": profile.get("about_text", ""),
         "skills_count": skills_value,
         "experience_count": experience_value,
-        "education_count": int(profile.get("education_count") or 0),
+        "education_count": education_value,
         "relevance_score": relevance_value,
-        "rank_score": round(normalized_score, 2),
-        "match_reasons": reasons,
-        "risks": [],
+        "rank_score": overall_score,
+        "match_reasons": match_reasons,
+        "risks": risks,
+        "dimension_scores": dim_scores,  # type: ignore[typeddict-item]
+        "dimension_reasons": dim_reasons,
     }
+
+
+def _merge_llm_dimension_ranking(
+    baseline_candidate: RankedCandidate,
+    llm_entry: Dict[str, Any],
+) -> RankedCandidate:
+    """Overlay LLM-refined dimension scores/reasons onto the deterministic baseline.
+
+    - Unknown/invalid per-dimension values are dropped (baseline retained).
+    - Final rank_score is re-aggregated from the merged dimension scores, so the
+      overall score is always consistent with its parts.
+    """
+    merged_scores: Dict[str, float] = dict(baseline_candidate["dimension_scores"])  # type: ignore[arg-type]
+    merged_reasons: Dict[str, str] = dict(baseline_candidate["dimension_reasons"])
+
+    llm_scores_raw = llm_entry.get("dimension_scores")
+    if isinstance(llm_scores_raw, dict):
+        for dimension_key in DIMENSION_KEYS:
+            if dimension_key not in llm_scores_raw:
+                continue
+            try:
+                numeric_value = float(llm_scores_raw[dimension_key])
+            except (TypeError, ValueError):
+                continue
+            merged_scores[dimension_key] = round(_clip_score(numeric_value), 2)
+
+    llm_reasons_raw = llm_entry.get("dimension_reasons")
+    if isinstance(llm_reasons_raw, dict):
+        for dimension_key in DIMENSION_KEYS:
+            reason_value = llm_reasons_raw.get(dimension_key)
+            if isinstance(reason_value, str) and reason_value.strip():
+                merged_reasons[dimension_key] = reason_value.strip()
+
+    refined_overall = _aggregate_rank_score(merged_scores)
+
+    match_reasons = _ensure_string_list(llm_entry.get("match_reasons")) or baseline_candidate["match_reasons"]
+    risks = _ensure_string_list(llm_entry.get("risks"))
+
+    refined_candidate: RankedCandidate = {
+        **baseline_candidate,  # type: ignore[misc]
+        "rank_score": refined_overall,
+        "match_reasons": match_reasons,
+        "risks": risks,
+        "dimension_scores": merged_scores,  # type: ignore[typeddict-item]
+        "dimension_reasons": merged_reasons,
+    }
+    return refined_candidate
 
 
 def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
@@ -236,17 +572,24 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
 
     capped_candidates = candidate_profiles[:MAX_RANKING_CANDIDATES]
 
+    # Deterministic 5-dimension baseline for every candidate (always available as fallback).
+    baseline_by_profile_id: Dict[str, RankedCandidate] = {}
+    for profile in capped_candidates:
+        baseline_candidate = _deterministic_rank(profile)
+        baseline_by_profile_id[baseline_candidate["profile_id"]] = baseline_candidate
+
     llm_model = _build_llm()
     if llm_model is None:
-        _append_error(state, "OPENAI_API_KEY missing; using deterministic ranking.")
-        state["ranked_candidates"] = [_deterministic_rank(profile) for profile in capped_candidates]
+        _append_error(state, "OPENAI_API_KEY missing; using deterministic 5-dimension ranking.")
+        ranked_list = sorted(baseline_by_profile_id.values(), key=lambda c: c["rank_score"], reverse=True)
+        state["ranked_candidates"] = ranked_list
         return state
 
     parsed_query = state.get("parsed_query") or dict(DEFAULT_PARSED_QUERY)
 
     ranking_payload = [
         {
-            "profile_id": profile.get("profile_id"),
+            "profile_id": baseline_by_profile_id[profile.get("profile_id", "")]["profile_id"],
             "name": profile.get("name"),
             "headline": profile.get("headline"),
             "location": profile.get("location"),
@@ -254,28 +597,53 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
             "experience_count": profile.get("experience_count"),
             "education_count": profile.get("education_count"),
             "about_text": _truncate_about(profile.get("about_text", "")),
+            "baseline_dimension_scores": baseline_by_profile_id[profile.get("profile_id", "")]["dimension_scores"],
+            "baseline_dimension_reasons": baseline_by_profile_id[profile.get("profile_id", "")]["dimension_reasons"],
         }
         for profile in capped_candidates
+        if profile.get("profile_id", "") in baseline_by_profile_id
     ]
 
     schema_example = [
         {
             "profile_id": "<string>",
-            "rank_score": 0.0,
+            "dimension_scores": {
+                "phd_researcher": 0.0,
+                "sf_location_fit": 0.0,
+                "technical_background": 0.0,
+                "education_prestige": 0.0,
+                "founder_experience": 0.0,
+            },
+            "dimension_reasons": {
+                "phd_researcher": "<evidence-based short reason>",
+                "sf_location_fit": "<evidence-based short reason>",
+                "technical_background": "<evidence-based short reason>",
+                "education_prestige": "<evidence-based short reason>",
+                "founder_experience": "<evidence-based short reason>",
+            },
             "match_reasons": ["<short bullet>"],
             "risks": ["<optional short bullet>"],
         }
     ]
 
     prompt_text = (
-        "You are a senior recruiter scoring LinkedIn candidates against a role brief.\n"
-        "Return ONLY valid JSON: a list of objects following this schema (no prose):\n"
+        "You are a senior recruiter scoring candidates for a fast-growing SF-based startup.\n"
+        "For each candidate score 5 dimensions (0-10, decimals ok):\n"
+        "  - phd_researcher: doctoral training, research roles, publications.\n"
+        "  - sf_location_fit: fit for an SF-based founding/early team. "
+        "SF/Bay Area ~10, California tech ~7, major US tech hub ~5, US/remote ~4, else 1-3.\n"
+        "  - technical_background: hands-on technical strength (engineer/ML/research titles, stack depth).\n"
+        "  - education_prestige: prestige and rigor of highest education.\n"
+        "  - founder_experience: prior founder, founding-team, or executive experience at startups.\n\n"
+        "Use `baseline_dimension_scores` as your starting point. Adjust ONLY when about_text/headline "
+        "clearly supports a different value. If there is no supporting evidence, keep the baseline.\n\n"
+        "Return ONLY valid JSON: a list of objects following this schema (no prose, no markdown):\n"
         f"{json.dumps(schema_example, indent=2)}\n\n"
         "Rules:\n"
-        "- rank_score is 0-10 (higher = better fit). Use decimals.\n"
-        "- Keep match_reasons <= 3 bullets, grounded in the provided about_text/headline.\n"
-        "- Include risks ONLY if concrete (missing skill, location mismatch, seniority gap); otherwise [].\n"
-        "- Keep the same number of items you were given and keep profile_id exact.\n\n"
+        "- Keep profile_id exact; include one object per candidate; same count in as out.\n"
+        "- Each dimension_reasons value <= 140 chars, grounded in the provided fields.\n"
+        "- match_reasons <= 3 bullets; risks empty [] unless concrete (missing skill, location mismatch, seniority gap).\n"
+        "- Do NOT output an overall rank_score; it will be re-aggregated from dimension_scores using fixed weights.\n\n"
         f"Role brief (user query): {state.get('question_text', '')}\n\n"
         f"Parsed filters: {json.dumps(parsed_query, ensure_ascii=False)}\n\n"
         f"Candidates JSON:\n{json.dumps(ranking_payload, ensure_ascii=False)}\n"
@@ -289,49 +657,22 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
             raise ValueError("LLM ranking response was not a JSON list.")
     except (json.JSONDecodeError, ValueError, TypeError) as rank_error:
         _append_error(state, f"rank_candidates fallback: {rank_error}")
-        state["ranked_candidates"] = [_deterministic_rank(profile) for profile in capped_candidates]
+        ranked_list = sorted(baseline_by_profile_id.values(), key=lambda c: c["rank_score"], reverse=True)
+        state["ranked_candidates"] = ranked_list
         return state
 
-    ranking_by_profile: Dict[str, Dict[str, Any]] = {}
     for ranking_entry in raw_rankings:
         if not isinstance(ranking_entry, dict):
             continue
         profile_key = ranking_entry.get("profile_id")
-        if isinstance(profile_key, str) and profile_key:
-            ranking_by_profile[profile_key] = ranking_entry
-
-    ranked_candidates: List[RankedCandidate] = []
-    for profile in capped_candidates:
-        profile_id_value = profile.get("profile_id", "")
-        llm_entry = ranking_by_profile.get(profile_id_value)
-        if llm_entry is None:
-            ranked_candidates.append(_deterministic_rank(profile))
+        if not isinstance(profile_key, str) or profile_key not in baseline_by_profile_id:
             continue
-
-        try:
-            rank_score_value = float(llm_entry.get("rank_score", FALLBACK_RANK_SCORE))
-        except (TypeError, ValueError):
-            rank_score_value = FALLBACK_RANK_SCORE
-        rank_score_value = max(0.0, min(10.0, rank_score_value))
-
-        ranked_candidates.append(
-            {
-                "profile_id": profile_id_value,
-                "name": profile.get("name", ""),
-                "headline": profile.get("headline", ""),
-                "location": profile.get("location", ""),
-                "about_text": profile.get("about_text", ""),
-                "skills_count": int(profile.get("skills_count") or 0),
-                "experience_count": int(profile.get("experience_count") or 0),
-                "education_count": int(profile.get("education_count") or 0),
-                "relevance_score": int(profile.get("relevance_score") or 0),
-                "rank_score": round(rank_score_value, 2),
-                "match_reasons": _ensure_string_list(llm_entry.get("match_reasons")),
-                "risks": _ensure_string_list(llm_entry.get("risks")),
-            }
+        baseline_by_profile_id[profile_key] = _merge_llm_dimension_ranking(
+            baseline_by_profile_id[profile_key],
+            ranking_entry,
         )
 
-    ranked_candidates.sort(key=lambda candidate: candidate["rank_score"], reverse=True)
+    ranked_candidates = sorted(baseline_by_profile_id.values(), key=lambda c: c["rank_score"], reverse=True)
     state["ranked_candidates"] = ranked_candidates
     return state
 

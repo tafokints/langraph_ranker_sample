@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "fitted_at": null,
+  "n_labels": 0,
+  "mae_before": null,
+  "mae_after": null,
+  "labeler": null,
+  "weights": {
+    "technical_background": 0.3,
+    "founder_experience": 0.25,
+    "phd_researcher": 0.15,
+    "education_prestige": 0.15,
+    "sf_location_fit": 0.15
+  }
+}

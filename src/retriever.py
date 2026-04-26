@@ -86,7 +86,9 @@ def _row_to_candidate(row: Sequence[Any]) -> Dict[str, Any]:
         "skills_count": int(row[5] or 0),
         "experience_count": int(row[6] or 0),
         "education_count": int(row[7] or 0),
-        "relevance_score": int(row[8] or 0),
+        "experience_json": row[8] or "",
+        "education_json": row[9] or "",
+        "relevance_score": int(row[10] or 0),
     }
 
 
@@ -169,6 +171,8 @@ def search_profiles(
         skills_count,
         experience_count,
         education_count,
+        experience_json,
+        education_json,
         ({' + '.join(score_clauses)}) AS relevance_score
     FROM linkedin_api_profiles_parsed
     WHERE {' AND '.join(where_clauses)}

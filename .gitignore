@@ -38,3 +38,7 @@ Thumbs.db
 # --- Notebooks / logs ---
 *.ipynb_checkpoints/
 *.log
+
+# --- Calibration loop artifacts (derived, not source of truth) ---
+reports/
+config/weights.prev.json

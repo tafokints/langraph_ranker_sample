@@ -16,6 +16,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.langgraph_app import run_recruiter_search
 
+REQUIRED_DIMENSION_KEYS = frozenset(
+    {
+        "phd_researcher",
+        "sf_location_fit",
+        "technical_background",
+        "education_prestige",
+        "founder_experience",
+    }
+)
+
 TEST_PROMPTS = [
     {
         "label": "role-focused",
@@ -45,7 +55,11 @@ def _fail(label: str, reason: str) -> None:
 def _passed(label: str, result: dict) -> None:
     ranked = result.get("ranked_candidates") or []
     top_scores = [c.get("rank_score") for c in ranked[:3]]
-    print(f"PASS[{label}]: candidates={len(ranked)}, top_scores={top_scores}")
+    top_dimension_sample = (ranked[0].get("dimension_scores") if ranked else {}) or {}
+    print(
+        f"PASS[{label}]: candidates={len(ranked)}, top_scores={top_scores}, "
+        f"top_dims={top_dimension_sample}"
+    )
 
 
 def main() -> int:
@@ -78,6 +92,16 @@ def main() -> int:
         summary_text = result.get("shortlist_summary") or ""
         if not summary_text.strip():
             _fail(label, "empty shortlist summary")
+            failures += 1
+            continue
+
+        first_candidate = ranked_candidates[0]
+        dimension_scores = first_candidate.get("dimension_scores") or {}
+        if not REQUIRED_DIMENSION_KEYS.issubset(dimension_scores.keys()):
+            _fail(
+                label,
+                f"missing dimension_scores keys: got {sorted(dimension_scores.keys())}",
+            )
             failures += 1
             continue
 
