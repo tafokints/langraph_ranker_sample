@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
@@ -18,6 +19,39 @@ MIN_TOP_K = 3
 MAX_TOP_K = 15
 MAX_MIN_EXPERIENCE = 15
 ABOUT_PREVIEW_CHARS = 500
+
+# Four starter chips mapped to the four rubric dimensions we want to exercise.
+# Keeps the demo dogfood-able without the reviewer having to invent a query.
+STARTER_PROMPTS: List[Dict[str, str]] = [
+    {
+        "label": "Role",
+        "prompt": "Senior staff ML engineer with recommender-systems experience in the Bay Area.",
+    },
+    {
+        "label": "Skill",
+        "prompt": "Backend engineer strong in Rust and distributed systems, US-based.",
+    },
+    {
+        "label": "Location",
+        "prompt": (
+            "Full-stack engineer based in San Francisco or willing to relocate; "
+            "open to early-stage startup risk."
+        ),
+    },
+    {
+        "label": "Founder",
+        "prompt": (
+            "Technical co-founder candidate with a PhD and prior founder or "
+            "first-engineer experience at a YC-backed company."
+        ),
+    },
+]
+
+ROLE_BRIEF_KEY = "role_brief_input"
+LAST_RESULT_KEY = "last_result"
+LAST_QUERY_KEY = "last_query"
+LAST_TOP_K_KEY = "last_top_k"
+LAST_MIN_EXP_KEY = "last_min_experience"
 
 DIMENSION_DISPLAY_ORDER = (
     ("technical_background", "Technical", 0.30),
@@ -38,12 +72,22 @@ ARCHITECTURE_MERMAID = """
 ```mermaid
 flowchart LR
     userQuery["User query (Streamlit)"] --> parseQuery[parse_query]
-    parseQuery -->|"structured filters"| retrieveCandidates[retrieve_candidates]
-    retrieveCandidates -->|"top-K rows (MySQL)"| rankCandidates[rank_candidates]
-    rankCandidates -->|"scored + rationales"| synthesizeShortlist[synthesize_shortlist]
+    parseQuery -->|"with_structured_output(ParsedQueryModel)"| retrieveCandidates[retrieve_candidates]
+    retrieveCandidates -->|"any about<200"| enrichLowInfo[enrich_low_info]
+    retrieveCandidates -->|"skip"| rankCandidates[rank_candidates]
+    enrichLowInfo --> rankCandidates
+    rankCandidates -->|"pointwise + listwise rerank"| synthesizeShortlist[synthesize_shortlist]
     synthesizeShortlist --> uiResult["Shortlist + citations"]
 ```
 """.strip()
+
+
+def _tracing_enabled() -> bool:
+    """True when either LANGSMITH_TRACING or LANGCHAIN_TRACING_V2 is set truthy."""
+    for env_var in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
+        if os.environ.get(env_var, "").strip().lower() in ("true", "1", "yes"):
+            return True
+    return False
 
 
 def _configure_page() -> None:
@@ -59,12 +103,31 @@ def _render_header() -> None:
     st.caption(APP_SUBTITLE)
 
 
+def _render_starter_prompts() -> None:
+    """Four single-click starter chips. Clicking a chip sets the role brief
+    via `st.session_state`; the text_area below picks it up via its `key`.
+    """
+    st.caption("Starter prompts — click one to pre-fill the role brief:")
+    chip_columns = st.columns(len(STARTER_PROMPTS))
+    for chip_column, prompt_entry in zip(chip_columns, STARTER_PROMPTS):
+        if chip_column.button(
+            prompt_entry["label"],
+            key=f"chip_{prompt_entry['label'].lower()}",
+            use_container_width=True,
+            help=prompt_entry["prompt"],
+        ):
+            st.session_state[ROLE_BRIEF_KEY] = prompt_entry["prompt"]
+
+
 def _render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
         st.header("Search")
+        _render_starter_prompts()
+        if ROLE_BRIEF_KEY not in st.session_state:
+            st.session_state[ROLE_BRIEF_KEY] = DEFAULT_QUERY
         query_text = st.text_area(
             "Role brief",
-            value=DEFAULT_QUERY,
+            key=ROLE_BRIEF_KEY,
             height=140,
             help="Describe the candidate profile you are looking for.",
         )
@@ -72,14 +135,14 @@ def _render_sidebar() -> Dict[str, Any]:
             "Top K candidates",
             min_value=MIN_TOP_K,
             max_value=MAX_TOP_K,
-            value=DEFAULT_TOP_K,
+            value=st.session_state.get(LAST_TOP_K_KEY, DEFAULT_TOP_K),
             help="How many candidates the retriever returns before ranking.",
         )
         min_experience_value = st.slider(
             "Min experience entries",
             min_value=0,
             max_value=MAX_MIN_EXPERIENCE,
-            value=0,
+            value=st.session_state.get(LAST_MIN_EXP_KEY, 0),
             help="Filter out profiles with fewer experience records than this.",
         )
         run_button = st.button("Run recruiter agent", type="primary")
@@ -103,9 +166,31 @@ def _render_sidebar() -> Dict[str, Any]:
         )
 
         st.divider()
-        st.subheader("Architecture")
-        st.markdown(ARCHITECTURE_MERMAID)
-        st.caption("Prototype retrieval: lexical SQL filter + LLM ranking. Not production RAG.")
+        st.subheader("Tracing")
+        if _tracing_enabled():
+            st.caption(
+                "LangSmith tracing is **on** (env var detected). "
+                "Each run is a trace tree with one child run per node."
+            )
+            latest_trace_url = st.session_state.get("latest_trace_url")
+            if latest_trace_url:
+                st.markdown(f"[Open latest run in LangSmith]({latest_trace_url})")
+            else:
+                st.caption("Run a query to populate the trace link.")
+        else:
+            st.caption(
+                "LangSmith tracing is **off**. "
+                "Set `LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY` to enable."
+            )
+
+        last_token_usage = st.session_state.get("latest_token_usage")
+        if last_token_usage:
+            st.caption(
+                f"Last run: **{int(last_token_usage.get('llm_calls', 0))}** LLM calls · "
+                f"**{int(last_token_usage.get('total_tokens', 0))}** tokens · "
+                f"~**${float(last_token_usage.get('estimated_cost_usd', 0.0)):.5f}** "
+                f"({last_token_usage.get('model', '?')})"
+            )
 
     return {
         "query_text": query_text,
@@ -129,12 +214,18 @@ def _truncate_about_for_ui(about_text: str) -> str:
     return about_text[:ABOUT_PREVIEW_CHARS].rstrip() + "..."
 
 
-def _render_rating_form(candidate: Dict[str, Any], labeler_name: str) -> None:
+def _render_rating_form(
+    candidate: Dict[str, Any],
+    labeler_name: str,
+    default_expanded: bool = False,
+) -> None:
     """Collapsed per-candidate rating form (5 per-dim + 1 overall + note).
 
     Sliders default to the system's current scores so the labeler can override
     only the dimensions they disagree with. All widget keys are namespaced by
-    profile_id so multiple cards on the page don't collide.
+    profile_id so multiple cards on the page don't collide. The rank-1 card
+    opens by default so the "this is how you teach the rubric" loop is
+    visible without scrolling.
     """
     profile_id_value = str(candidate.get("profile_id", "")).strip()
     if not profile_id_value:
@@ -143,7 +234,7 @@ def _render_rating_form(candidate: Dict[str, Any], labeler_name: str) -> None:
     heuristic_dimension_scores = candidate.get("dimension_scores") or {}
     heuristic_overall_score = float(candidate.get("rank_score") or 5.0)
 
-    with st.expander("Rate this candidate"):
+    with st.expander("Rate this candidate", expanded=default_expanded):
         st.caption(
             "Score each dimension 0-10 as a non-technical reviewer would; "
             "then score the overall fit. Defaults are the system's current scores."
@@ -269,7 +360,11 @@ def _render_candidate_cards(ranked_candidates: List[Dict[str, Any]], labeler_nam
                 with st.expander("About (preview)"):
                     st.write(about_preview)
 
-            _render_rating_form(candidate, labeler_name)
+            _render_rating_form(
+                candidate,
+                labeler_name,
+                default_expanded=(rank_index == 1),
+            )
 
             st.caption(f"Source: `{candidate.get('profile_id', '')}`")
 
@@ -282,6 +377,41 @@ def _render_shortlist(summary_text: str) -> None:
         st.info("Run a query to see the shortlist summary.")
 
 
+def _render_copy_profile_ids(ranked_candidates: List[Dict[str, Any]]) -> None:
+    """Render ranked profile_ids in an `st.code` block so Streamlit's
+    built-in copy-to-clipboard widget is usable without a custom JS escape
+    hatch. One ID per line keeps it pasteable into any tool.
+    """
+    if not ranked_candidates:
+        return
+    profile_id_values = [
+        str(candidate.get("profile_id", "")).strip()
+        for candidate in ranked_candidates
+        if str(candidate.get("profile_id", "")).strip()
+    ]
+    if not profile_id_values:
+        return
+    with st.expander(f"Copy {len(profile_id_values)} shortlisted profile_ids"):
+        st.caption("Click the copy icon in the top-right of the code block.")
+        st.code("\n".join(profile_id_values), language="text")
+
+
+def _render_run_metrics(token_usage: Dict[str, Any], trace_url: str) -> None:
+    if not token_usage and not trace_url:
+        return
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("LLM calls", int(token_usage.get("llm_calls", 0)))
+    metric_columns[1].metric("Tokens", int(token_usage.get("total_tokens", 0)))
+    metric_columns[2].metric(
+        "Est. cost (USD)",
+        f"${float(token_usage.get('estimated_cost_usd', 0.0)):.5f}",
+    )
+    with metric_columns[3]:
+        st.metric("Trace", "open" if trace_url else "—")
+        if trace_url:
+            st.markdown(f"[Open in LangSmith]({trace_url})")
+
+
 def _render_errors(error_messages: List[str]) -> None:
     if not error_messages:
         return
@@ -290,45 +420,92 @@ def _render_errors(error_messages: List[str]) -> None:
             st.warning(message)
 
 
+def _render_architecture_panel() -> None:
+    """Top-of-page architecture view. Keeps the graph shape visible on the
+    primary surface so reviewers don't have to open the sidebar to see it.
+    """
+    with st.expander("Architecture (LangGraph pipeline)", expanded=False):
+        st.markdown(ARCHITECTURE_MERMAID)
+        st.caption(
+            "Hybrid retrieval: lexical SQL ∪ FAISS embedding recall. "
+            "Two-stage ranking: pointwise scoring + listwise rerank. "
+            "Near-ties (<0.3) go through a pairwise LLM tie-break."
+        )
+
+
 def main() -> None:
     _configure_page()
     _render_header()
 
     sidebar_values = _render_sidebar()
     query_text = sidebar_values["query_text"].strip()
+    top_k_value = sidebar_values["top_k"]
+    min_experience_value = sidebar_values["min_experience"]
+    labeler_value = sidebar_values["labeler"]
 
-    if not sidebar_values["run_button"]:
-        st.info("Enter a role brief on the left and click **Run recruiter agent**.")
-        return
+    _render_architecture_panel()
 
-    if not query_text:
-        st.warning("Please enter a role brief before running the agent.")
-        return
-
-    with st.status("Running LangGraph pipeline...", expanded=False) as run_status:
-        try:
-            result = run_recruiter_search(
-                question_text=query_text,
-                top_k=sidebar_values["top_k"],
-                min_experience_entries=sidebar_values["min_experience"],
-            )
-            run_status.update(label="Pipeline complete", state="complete")
-        except Exception as run_error:  # noqa: BLE001 - surface to user
-            run_status.update(label="Pipeline failed", state="error")
-            st.error(f"LangGraph run failed: {run_error}")
+    if sidebar_values["run_button"]:
+        if not query_text:
+            st.warning("Please enter a role brief before running the agent.")
             return
+        with st.status("Running LangGraph pipeline...", expanded=False) as run_status:
+            try:
+                result = run_recruiter_search(
+                    question_text=query_text,
+                    top_k=top_k_value,
+                    min_experience_entries=min_experience_value,
+                )
+                run_status.update(label="Pipeline complete", state="complete")
+            except Exception as run_error:  # noqa: BLE001 - surface to user
+                run_status.update(label="Pipeline failed", state="error")
+                st.error(f"LangGraph run failed: {run_error}")
+                return
+
+        trace_url_value = result.get("trace_url")
+        if trace_url_value:
+            st.session_state["latest_trace_url"] = trace_url_value
+            st.sidebar.success(f"[LangSmith trace]({trace_url_value})")
+
+        token_usage_value = result.get("token_usage") or {}
+        if token_usage_value:
+            st.session_state["latest_token_usage"] = token_usage_value
+
+        st.session_state[LAST_RESULT_KEY] = result
+        st.session_state[LAST_QUERY_KEY] = query_text
+        st.session_state[LAST_TOP_K_KEY] = top_k_value
+        st.session_state[LAST_MIN_EXP_KEY] = min_experience_value
+
+    cached_result: Optional[Dict[str, Any]] = st.session_state.get(LAST_RESULT_KEY)
+    if cached_result is None:
+        st.info(
+            "Pick a starter prompt or enter a role brief on the left and "
+            "click **Run recruiter agent**."
+        )
+        return
+
+    cached_query_text = st.session_state.get(LAST_QUERY_KEY, "")
+    if cached_query_text:
+        st.caption(f"Showing last run: `{cached_query_text}`")
+
+    _render_run_metrics(
+        cached_result.get("token_usage") or {},
+        cached_result.get("trace_url", ""),
+    )
 
     top_columns = st.columns([1, 1])
     with top_columns[0]:
-        _render_parsed_filters(result.get("parsed_query", {}))
+        _render_parsed_filters(cached_result.get("parsed_query", {}))
     with top_columns[1]:
-        _render_shortlist(result.get("shortlist_summary", ""))
+        _render_shortlist(cached_result.get("shortlist_summary", ""))
 
-    _render_candidate_cards(result.get("ranked_candidates", []), sidebar_values["labeler"])
-    _render_errors(result.get("error_messages", []))
+    ranked_candidates_value = cached_result.get("ranked_candidates", [])
+    _render_copy_profile_ids(ranked_candidates_value)
+    _render_candidate_cards(ranked_candidates_value, labeler_value)
+    _render_errors(cached_result.get("error_messages", []))
 
     with st.expander("Raw result JSON (debug)"):
-        st.code(json.dumps(result, ensure_ascii=False, indent=2), language="json")
+        st.code(json.dumps(cached_result, ensure_ascii=False, indent=2), language="json")
 
 
 if __name__ == "__main__":
