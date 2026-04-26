@@ -1,15 +1,37 @@
 {
-  "version": "v1",
-  "fitted_at": null,
-  "n_labels": 0,
-  "mae_before": null,
-  "mae_after": null,
-  "labeler": null,
+  "version": "v2",
+  "fitted_at": "2026-04-26T05:42:05+00:00",
+  "n_labels": 21,
+  "mae_before": 0.8367,
+  "mae_after": 0.3448,
+  "labeler": "seed-demo",
   "weights": {
-    "technical_background": 0.3,
-    "founder_experience": 0.25,
-    "phd_researcher": 0.15,
-    "education_prestige": 0.15,
-    "sf_location_fit": 0.15
+    "phd_researcher": 0.098925,
+    "sf_location_fit": 0.215866,
+    "technical_background": 0.359036,
+    "education_prestige": 0.057337,
+    "founder_experience": 0.268835
+  },
+  "gains": {
+    "phd_researcher": {
+      "gain": 0.82112,
+      "bias": 0.133458
+    },
+    "sf_location_fit": {
+      "gain": 0.979544,
+      "bias": 0.031633
+    },
+    "technical_background": {
+      "gain": 0.867634,
+      "bias": 1.242962
+    },
+    "education_prestige": {
+      "gain": 0.907526,
+      "bias": -0.710606
+    },
+    "founder_experience": {
+      "gain": 1.029616,
+      "bias": 0.364953
+    }
   }
 }

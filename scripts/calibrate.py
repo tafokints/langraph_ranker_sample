@@ -40,14 +40,25 @@ from scipy.stats import spearmanr
 from src.labels_store import load_labels
 from src.langgraph_app import (
     DEFAULT_DIMENSION_WEIGHTS,
+    DIMENSION_GAINS,
     DIMENSION_KEYS,
     DIMENSION_LABELS,
     DIMENSION_WEIGHTS,
     _aggregate_rank_score,
+    _apply_dimension_gains,
     _deterministic_rank,
 )
 from src.retriever import _open_connection as open_profile_connection
-from src.weights_loader import next_version, save_weights, weights_file_path
+from src.weights_loader import (
+    BIAS_MAX,
+    BIAS_MIN,
+    GAIN_MAX,
+    GAIN_MIN,
+    default_dimension_gains,
+    next_version,
+    save_weights,
+    weights_file_path,
+)
 
 DEFAULT_MIN_LABELS = 15
 BIAS_FLAG_THRESHOLD = 1.5
@@ -225,12 +236,69 @@ def _project_onto_probability_simplex(vector_values: np.ndarray) -> np.ndarray:
     return projected_values / total_mass
 
 
-def _fit_weights_constrained(samples: Sequence[LabeledSample]) -> Dict[str, float]:
+def _fit_dimension_gains(
+    samples: Sequence[LabeledSample],
+) -> Dict[str, Dict[str, float]]:
+    """Per-dimension OLS fit of the affine transform `gain * raw + bias`.
+
+    For each dimension we solve argmin over (g, b) of sum_s (g * raw_s + b - human_s)^2
+    independently. Degenerate columns (zero heuristic variance) fall back to
+    identity so we don't produce inf/nan when every profile got the same score.
+    Results are clamped to [GAIN_MIN, GAIN_MAX] and [BIAS_MIN, BIAS_MAX] so
+    a single outlier can't yank a dimension off its sensible range.
+    """
+    fitted_gains: Dict[str, Dict[str, float]] = {}
+    for dimension_key in DIMENSION_KEYS:
+        raw_values = np.array(
+            [sample.heuristic_dim_scores.get(dimension_key, 0.0) for sample in samples],
+            dtype=float,
+        )
+        human_values = np.array(
+            [sample.human_dim_scores.get(dimension_key, 0.0) for sample in samples],
+            dtype=float,
+        )
+        if raw_values.size < 2 or float(np.std(raw_values)) < 1e-6:
+            fitted_gains[dimension_key] = {"gain": 1.0, "bias": 0.0}
+            continue
+        design_matrix = np.column_stack([raw_values, np.ones_like(raw_values)])
+        least_squares_solution, _residual_vec, _rank, _singular_values = np.linalg.lstsq(
+            design_matrix, human_values, rcond=None
+        )
+        gain_raw = float(least_squares_solution[0])
+        bias_raw = float(least_squares_solution[1])
+        gain_clamped = max(GAIN_MIN, min(GAIN_MAX, gain_raw))
+        bias_clamped = max(BIAS_MIN, min(BIAS_MAX, bias_raw))
+        fitted_gains[dimension_key] = {"gain": gain_clamped, "bias": bias_clamped}
+    return fitted_gains
+
+
+def _fit_weights_constrained(
+    samples: Sequence[LabeledSample],
+    gains: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, float]:
+    """NNLS + simplex-projection fit of weights on the (optionally adjusted) dims."""
     dimension_count = len(DIMENSION_KEYS)
-    design_matrix = np.array(
-        [[sample.heuristic_dim_scores.get(key, 0.0) for key in DIMENSION_KEYS] for sample in samples],
-        dtype=float,
-    )
+    if gains is None:
+        design_matrix = np.array(
+            [
+                [sample.heuristic_dim_scores.get(key, 0.0) for key in DIMENSION_KEYS]
+                for sample in samples
+            ],
+            dtype=float,
+        )
+    else:
+        design_matrix = np.array(
+            [
+                [
+                    _apply_dimension_gains(sample.heuristic_dim_scores, gains=gains).get(
+                        key, 0.0
+                    )
+                    for key in DIMENSION_KEYS
+                ]
+                for sample in samples
+            ],
+            dtype=float,
+        )
     target_overall = np.array([sample.human_overall for sample in samples], dtype=float)
 
     if design_matrix.size == 0:
@@ -246,18 +314,235 @@ def _fit_weights_constrained(samples: Sequence[LabeledSample]) -> Dict[str, floa
     return {dimension_key: float(projected_weights[idx]) for idx, dimension_key in enumerate(DIMENSION_KEYS)}
 
 
-def _compute_overall_mae(samples: Sequence[LabeledSample], weights: Dict[str, float]) -> float:
+def _bias_vs_weight_diagnostic(
+    samples: Sequence[LabeledSample],
+    fitted_gains: Dict[str, Dict[str, float]],
+    weights_only_mae: float,
+) -> List[Dict[str, float]]:
+    """For each dimension, compare 'fix bias on this dim + refit weights' vs
+    'refit weights only, all gains identity'.
+
+    If a dimension's bias-fix MAE is materially lower than the weights-only
+    baseline, the scorer has a systematic offset that re-weighting alone
+    cannot absorb — the right fix is in the scorer (token lists, proximity
+    windows) rather than in `config/weights.json`. If the two MAEs are
+    close, re-weighting already covers it.
+
+    We don't touch `gain`; only `bias`. This isolates the additive-offset
+    hypothesis from the linear-rescale hypothesis.
+    """
+    diagnostic_rows: List[Dict[str, float]] = []
+    for dimension_key in DIMENSION_KEYS:
+        bias_only_gains: Dict[str, Dict[str, float]] = {
+            other_key: {"gain": 1.0, "bias": 0.0} for other_key in DIMENSION_KEYS
+        }
+        bias_only_gains[dimension_key] = {
+            "gain": 1.0,
+            "bias": float(fitted_gains.get(dimension_key, {}).get("bias", 0.0)),
+        }
+        refit_weights = _fit_weights_constrained(samples, gains=bias_only_gains)
+        bias_fix_mae = _compute_overall_mae(samples, refit_weights, gains=bias_only_gains)
+        diagnostic_rows.append(
+            {
+                "dimension": dimension_key,
+                "bias_applied": float(bias_only_gains[dimension_key]["bias"]),
+                "bias_fix_mae": float(bias_fix_mae),
+                "weights_only_mae": float(weights_only_mae),
+                "delta": float(weights_only_mae - bias_fix_mae),
+            }
+        )
+    return diagnostic_rows
+
+
+def _format_bias_vs_weight_table(
+    diagnostic_rows: Sequence[Dict[str, float]],
+) -> str:
+    header = (
+        "| Dimension | Bias applied (Δ) | Bias-fix MAE | Weights-only MAE | "
+        "Weights-only - Bias-fix | Recommendation |\n"
+        "|---|---|---|---|---|---|\n"
+    )
+    rows: List[str] = []
+    for diagnostic_row in diagnostic_rows:
+        delta_value = float(diagnostic_row.get("delta", 0.0))
+        if delta_value > 0.05:
+            recommendation = "fix scorer (bias helps)"
+        elif delta_value < -0.05:
+            recommendation = "leave scorer (bias hurts)"
+        else:
+            recommendation = "re-weighting covers it"
+        rows.append(
+            f"| {DIMENSION_LABELS.get(str(diagnostic_row['dimension']), str(diagnostic_row['dimension']))} "
+            f"| {float(diagnostic_row['bias_applied']):+.3f} "
+            f"| {float(diagnostic_row['bias_fix_mae']):.3f} "
+            f"| {float(diagnostic_row['weights_only_mae']):.3f} "
+            f"| {delta_value:+.3f} "
+            f"| {recommendation} |"
+        )
+    return header + "\n".join(rows)
+
+
+def _per_labeler_summary(
+    samples: Sequence[LabeledSample],
+    weights: Dict[str, float],
+    gains: Dict[str, Dict[str, float]],
+) -> List[Dict[str, Any]]:
+    """Per-labeler diagnostic: how does each labeler compare to the fitted model?
+
+    Splits samples by labeler handle and computes N, overall MAE (using the
+    supplied weights + gains — i.e. the fitted ones), per-dim mean absolute
+    deviation from the heuristic, and the labeler's mean overall score. This
+    surfaces a labeler who's systematically more generous/harsh than the rest.
+    """
+    labeler_groups: Dict[str, List[LabeledSample]] = {}
+    for sample in samples:
+        labeler_groups.setdefault(sample.labeler, []).append(sample)
+    summary_rows: List[Dict[str, Any]] = []
+    for labeler_handle, labeler_samples in sorted(labeler_groups.items()):
+        labeler_overall_mae = _compute_overall_mae(labeler_samples, weights, gains=gains)
+        dim_mean_abs_dev: Dict[str, float] = {}
+        for dimension_key in DIMENSION_KEYS:
+            differences = [
+                sample.heuristic_dim_scores.get(dimension_key, 0.0)
+                - sample.human_dim_scores.get(dimension_key, 0.0)
+                for sample in labeler_samples
+            ]
+            dim_mean_abs_dev[dimension_key] = (
+                float(np.mean(np.abs(differences))) if differences else 0.0
+            )
+        human_overall_values = [float(sample.human_overall) for sample in labeler_samples]
+        summary_rows.append(
+            {
+                "labeler": labeler_handle,
+                "n": len(labeler_samples),
+                "overall_mae": labeler_overall_mae,
+                "mean_human_overall": (
+                    float(np.mean(human_overall_values)) if human_overall_values else 0.0
+                ),
+                "dim_mae": dim_mean_abs_dev,
+            }
+        )
+    return summary_rows
+
+
+def _format_per_labeler_table(summary_rows: Sequence[Dict[str, Any]]) -> str:
+    header_cells = ["| Labeler | N | Overall MAE | Mean human overall"]
+    separator_cells = ["|---|---|---|---"]
+    for dimension_key in DIMENSION_KEYS:
+        header_cells.append(f"| Δ {DIMENSION_LABELS.get(dimension_key, dimension_key)}")
+        separator_cells.append("|---")
+    header_cells.append(" |")
+    separator_cells.append("|")
+    lines: List[str] = ["".join(header_cells), "".join(separator_cells)]
+    for row in summary_rows:
+        cells = [
+            f"| {row['labeler']} ",
+            f"| {int(row['n'])} ",
+            f"| {float(row['overall_mae']):.3f} ",
+            f"| {float(row['mean_human_overall']):.2f} ",
+        ]
+        for dimension_key in DIMENSION_KEYS:
+            cells.append(f"| {float(row['dim_mae'].get(dimension_key, 0.0)):.2f} ")
+        cells.append("|")
+        lines.append("".join(cells))
+    return "\n".join(lines)
+
+
+def _inter_labeler_disagreement_matrix(
+    samples: Sequence[LabeledSample],
+) -> Optional[List[List[Any]]]:
+    """Return an NxN disagreement matrix (list-of-lists suitable for Markdown).
+
+    Cell (A, B) is the mean |overall_A - overall_B| over profiles both
+    labeled. Diagonal is always 0. Returns None when there is only one
+    labeler — there's no pair to compare, so the matrix is vacuous.
+    """
+    labeler_to_profiles: Dict[str, Dict[str, float]] = {}
+    for sample in samples:
+        labeler_to_profiles.setdefault(sample.labeler, {})[sample.profile_id] = float(
+            sample.human_overall
+        )
+    labeler_handles = sorted(labeler_to_profiles.keys())
+    if len(labeler_handles) < 2:
+        return None
+
+    matrix: List[List[Any]] = []
+    header_row: List[Any] = [""]
+    header_row.extend(labeler_handles)
+    matrix.append(header_row)
+    for row_labeler in labeler_handles:
+        row_cells: List[Any] = [row_labeler]
+        for column_labeler in labeler_handles:
+            if row_labeler == column_labeler:
+                row_cells.append("0.00")
+                continue
+            shared_profile_ids = set(labeler_to_profiles[row_labeler].keys()) & set(
+                labeler_to_profiles[column_labeler].keys()
+            )
+            if not shared_profile_ids:
+                row_cells.append("n/a")
+                continue
+            differences = [
+                abs(
+                    labeler_to_profiles[row_labeler][profile_id_value]
+                    - labeler_to_profiles[column_labeler][profile_id_value]
+                )
+                for profile_id_value in shared_profile_ids
+            ]
+            row_cells.append(f"{float(np.mean(differences)):.2f} (n={len(differences)})")
+        matrix.append(row_cells)
+    return matrix
+
+
+def _format_matrix_as_markdown(matrix: Sequence[Sequence[Any]]) -> str:
+    if not matrix:
+        return ""
+    header_cells = matrix[0]
+    header_line = "| " + " | ".join(str(cell) for cell in header_cells) + " |"
+    separator_line = "|" + "|".join(["---"] * len(header_cells)) + "|"
+    body_lines: List[str] = []
+    for row in matrix[1:]:
+        body_lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return "\n".join([header_line, separator_line, *body_lines])
+
+
+def _compute_overall_mae(
+    samples: Sequence[LabeledSample],
+    weights: Dict[str, float],
+    gains: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """MAE of predicted vs human overall. If `gains` is supplied the raw
+    dimension scores are passed through the affine transform first, matching
+    what the live pipeline will do with the same (weights, gains) pair."""
     if not samples:
         return 0.0
     total_absolute_error = 0.0
     for sample in samples:
+        if gains is None:
+            dim_scores_for_sum = sample.heuristic_dim_scores
+        else:
+            dim_scores_for_sum = _apply_dimension_gains(
+                sample.heuristic_dim_scores, gains=gains
+            )
         predicted_overall = sum(
-            float(weights.get(key, 0.0)) * float(sample.heuristic_dim_scores.get(key, 0.0))
+            float(weights.get(key, 0.0)) * float(dim_scores_for_sum.get(key, 0.0))
             for key in DIMENSION_KEYS
         )
         predicted_overall = max(0.0, min(10.0, predicted_overall))
         total_absolute_error += abs(predicted_overall - sample.human_overall)
     return total_absolute_error / len(samples)
+
+
+def _format_gains_block(label: str, gains: Dict[str, Dict[str, float]]) -> str:
+    lines = [f"**{label}**"]
+    for dimension_key in DIMENSION_KEYS:
+        dimension_gain_entry = gains.get(dimension_key, {"gain": 1.0, "bias": 0.0})
+        lines.append(
+            f"- {DIMENSION_LABELS.get(dimension_key, dimension_key)}: "
+            f"gain={float(dimension_gain_entry['gain']):.3f}, "
+            f"bias={float(dimension_gain_entry['bias']):+.3f}"
+        )
+    return "\n".join(lines)
 
 
 def _format_dimension_metrics_table(metrics: Dict[str, Dict[str, float]]) -> str:
@@ -330,6 +615,32 @@ def _parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help="Print the report but do not write config/weights.json.",
     )
+    parser.add_argument(
+        "--fit-gains",
+        dest="fit_gains",
+        action="store_true",
+        default=True,
+        help=(
+            "Fit per-dimension affine gains (gain, bias) before fitting weights. "
+            "This is on by default; use --no-fit-gains to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-fit-gains",
+        dest="fit_gains",
+        action="store_false",
+        help="Disable per-dimension gain fit; only fit global weights.",
+    )
+    parser.add_argument(
+        "--per-labeler",
+        action="store_true",
+        help=(
+            "Add per-labeler MAE + inter-labeler disagreement matrix to the "
+            "report. Useful when multiple humans have rated overlapping "
+            "candidates and you want to see whether they mean the same thing "
+            "by each dimension."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -371,10 +682,10 @@ def main() -> int:
     )
     report_lines.append("")
 
-    mae_before_fit = _compute_overall_mae(samples, DIMENSION_WEIGHTS)
+    mae_before_fit = _compute_overall_mae(samples, DIMENSION_WEIGHTS, gains=DIMENSION_GAINS)
     report_lines.append("## Overall score alignment")
     report_lines.append("")
-    report_lines.append(f"- Overall MAE with current weights: **{mae_before_fit:.3f}**")
+    report_lines.append(f"- Overall MAE with current weights+gains: **{mae_before_fit:.3f}**")
 
     if n_samples < cli_args.min_labels:
         report_lines.append("")
@@ -384,6 +695,8 @@ def main() -> int:
         )
         report_lines.append("")
         report_lines.append(_format_weights_block("Current weights (unchanged)", DIMENSION_WEIGHTS))
+        report_lines.append("")
+        report_lines.append(_format_gains_block("Current gains (unchanged)", DIMENSION_GAINS))
         report_path = _write_report(report_lines, report_timestamp)
         print(
             f"Need >={cli_args.min_labels} labels to fit weights (have {n_samples}). "
@@ -391,10 +704,26 @@ def main() -> int:
         )
         return 0
 
-    fitted_weights = _fit_weights_constrained(samples)
-    mae_after_fit = _compute_overall_mae(samples, fitted_weights)
+    if cli_args.fit_gains:
+        fitted_gains = _fit_dimension_gains(samples)
+        weights_only_fitted = _fit_weights_constrained(samples, gains=None)
+        mae_weights_only = _compute_overall_mae(
+            samples, weights_only_fitted, gains=None
+        )
+        fitted_weights = _fit_weights_constrained(samples, gains=fitted_gains)
+        mae_after_fit = _compute_overall_mae(samples, fitted_weights, gains=fitted_gains)
+    else:
+        fitted_gains = default_dimension_gains(DEFAULT_DIMENSION_WEIGHTS)
+        mae_weights_only = None
+        weights_only_fitted = _fit_weights_constrained(samples, gains=None)
+        fitted_weights = weights_only_fitted
+        mae_after_fit = _compute_overall_mae(samples, fitted_weights, gains=None)
 
-    report_lines.append(f"- Overall MAE with fitted weights: **{mae_after_fit:.3f}**")
+    report_lines.append(f"- Overall MAE with fitted weights+gains: **{mae_after_fit:.3f}**")
+    if mae_weights_only is not None:
+        report_lines.append(
+            f"- Ablation (fit weights only, gains fixed at identity): **{mae_weights_only:.3f}**"
+        )
     improvement_delta = mae_before_fit - mae_after_fit
     report_lines.append(f"- Improvement: **{improvement_delta:+.3f}** (positive = better)")
     report_lines.append("")
@@ -402,6 +731,61 @@ def main() -> int:
     report_lines.append("")
     report_lines.append(_format_weights_block("Fitted weights (after fit)", fitted_weights))
     report_lines.append("")
+    report_lines.append(_format_gains_block("Current gains (before fit)", DIMENSION_GAINS))
+    report_lines.append("")
+    report_lines.append(_format_gains_block("Fitted gains (after fit)", fitted_gains))
+    report_lines.append("")
+
+    if mae_weights_only is not None:
+        report_lines.append("## Bias vs weight diagnostic")
+        report_lines.append("")
+        report_lines.append(
+            "For each dimension we ask: if I *only* shift this dimension's "
+            "baseline (gain=1, bias=fitted_bias) and then refit weights on "
+            "top of that, how does the MAE compare to the \"just refit "
+            "weights, gains=identity\" baseline? A positive Δ means the "
+            "systematic offset is real and the scorer itself should be "
+            "tightened. Near-zero Δ means re-weighting already absorbs it."
+        )
+        report_lines.append("")
+        diagnostic_rows = _bias_vs_weight_diagnostic(
+            samples, fitted_gains, mae_weights_only
+        )
+        report_lines.append(_format_bias_vs_weight_table(diagnostic_rows))
+        report_lines.append("")
+
+    if cli_args.per_labeler:
+        report_lines.append("## Per-labeler diagnostics")
+        report_lines.append("")
+        per_labeler_rows = _per_labeler_summary(
+            samples, weights=fitted_weights, gains=fitted_gains
+        )
+        report_lines.append(
+            "Overall MAE is computed against the *fitted* weights and gains. "
+            "Per-dim columns show mean |heuristic - human| for that labeler. "
+            "A row with much higher overall MAE than the others usually means "
+            "that labeler interprets the rubric differently, not that the "
+            "model got worse for them."
+        )
+        report_lines.append("")
+        report_lines.append(_format_per_labeler_table(per_labeler_rows))
+        report_lines.append("")
+        disagreement_matrix = _inter_labeler_disagreement_matrix(samples)
+        if disagreement_matrix is not None:
+            report_lines.append("### Inter-labeler overall disagreement")
+            report_lines.append("")
+            report_lines.append(
+                "Mean |overall_A - overall_B| on profiles both labelers rated. "
+                "`n/a` means the pair has no shared profiles."
+            )
+            report_lines.append("")
+            report_lines.append(_format_matrix_as_markdown(disagreement_matrix))
+            report_lines.append("")
+        else:
+            report_lines.append(
+                "Only one labeler present — skipping inter-labeler disagreement matrix."
+            )
+            report_lines.append("")
 
     if cli_args.dry_run:
         report_lines.append("Dry run: `config/weights.json` NOT written.")
@@ -421,6 +805,7 @@ def main() -> int:
         mae_before=round(mae_before_fit, 4),
         mae_after=round(mae_after_fit, 4),
         labeler=cli_args.labeler,
+        gains=fitted_gains,
     )
     report_lines.append(f"Wrote `{weights_file_path()}` (version `{new_version}`).")
     report_path = _write_report(report_lines, report_timestamp)
