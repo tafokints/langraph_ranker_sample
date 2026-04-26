@@ -92,21 +92,16 @@ def _row_to_candidate(row: Sequence[Any]) -> Dict[str, Any]:
     }
 
 
-def search_profiles(
-    role_keywords: Optional[Sequence[str]] = None,
-    skills: Optional[Sequence[str]] = None,
-    location: Optional[str] = None,
-    min_experience_entries: int = 0,
-    must_have_keywords: Optional[Sequence[str]] = None,
-    nice_to_have_keywords: Optional[Sequence[str]] = None,
-    top_k: int = DEFAULT_TOP_K,
+def _search_profiles_once(
+    role_keywords: Optional[Sequence[str]],
+    skills: Optional[Sequence[str]],
+    location: Optional[str],
+    min_experience_entries: int,
+    must_have_keywords: Optional[Sequence[str]],
+    nice_to_have_keywords: Optional[Sequence[str]],
+    top_k: int,
 ) -> List[Dict[str, Any]]:
-    """Retrieve candidates from linkedin_api_profiles_parsed using structured filters.
-
-    Scoring is lexical: weighted LIKE matches across `about_text`, `headline`, and `name`.
-    Structured filters (skills, location, min_experience_entries, must_have) are applied
-    as SQL WHERE constraints so we do not waste LLM tokens on clearly unqualified rows.
-    """
+    """One SQL round-trip with a single set of filters. Caller composes unions."""
     role_terms = _clean_keyword_list(role_keywords)
     skill_terms = _clean_keyword_list(skills)
     must_have_terms = _clean_keyword_list(must_have_keywords)
@@ -190,6 +185,81 @@ def search_profiles(
     return [_row_to_candidate(row) for row in query_rows]
 
 
+def search_profiles(
+    role_keywords: Optional[Sequence[str]] = None,
+    role_paraphrases: Optional[Sequence[str]] = None,
+    skills: Optional[Sequence[str]] = None,
+    location: Optional[str] = None,
+    min_experience_entries: int = 0,
+    must_have_keywords: Optional[Sequence[str]] = None,
+    nice_to_have_keywords: Optional[Sequence[str]] = None,
+    top_k: int = DEFAULT_TOP_K,
+) -> List[Dict[str, Any]]:
+    """Retrieve candidates from linkedin_api_profiles_parsed using structured filters.
+
+    Scoring is lexical: weighted LIKE matches across `about_text`, `headline`, and `name`.
+    Structured filters (skills, location, min_experience_entries, must_have) are applied
+    as SQL WHERE constraints so we do not waste LLM tokens on clearly unqualified rows.
+
+    Round 2 query-expansion: when `role_paraphrases` is non-empty the retriever
+    runs one additional SQL round-trip per paraphrase with the paraphrase as
+    both a role_keyword AND the sole must_have_keyword, then UNIONS the
+    candidate sets by `profile_id`, keeping the max `relevance_score` per
+    profile. This surfaces candidates who only match the paraphrase (e.g.
+    "machine learning engineer") without relaxing the primary query's
+    must_have filter.
+    """
+    primary_candidates = _search_profiles_once(
+        role_keywords=role_keywords,
+        skills=skills,
+        location=location,
+        min_experience_entries=min_experience_entries,
+        must_have_keywords=must_have_keywords,
+        nice_to_have_keywords=nice_to_have_keywords,
+        top_k=top_k,
+    )
+
+    paraphrase_terms = _clean_keyword_list(role_paraphrases)
+    if not paraphrase_terms:
+        return primary_candidates
+
+    candidates_by_profile_id: Dict[str, Dict[str, Any]] = {
+        c["profile_id"]: c for c in primary_candidates
+    }
+    primary_role_terms = list(_clean_keyword_list(role_keywords))
+
+    for paraphrase_term in paraphrase_terms:
+        paraphrase_role_keywords = primary_role_terms + [paraphrase_term]
+        try:
+            paraphrase_candidates = _search_profiles_once(
+                role_keywords=paraphrase_role_keywords,
+                skills=skills,
+                location=location,
+                min_experience_entries=min_experience_entries,
+                must_have_keywords=[paraphrase_term],
+                nice_to_have_keywords=nice_to_have_keywords,
+                top_k=top_k,
+            )
+        except Exception:  # noqa: BLE001 - paraphrase queries are best-effort
+            continue
+
+        for candidate in paraphrase_candidates:
+            profile_key = candidate["profile_id"]
+            existing_candidate = candidates_by_profile_id.get(profile_key)
+            if existing_candidate is None:
+                candidates_by_profile_id[profile_key] = candidate
+                continue
+            if candidate.get("relevance_score", 0) > existing_candidate.get("relevance_score", 0):
+                candidates_by_profile_id[profile_key] = candidate
+
+    merged_candidates = sorted(
+        candidates_by_profile_id.values(),
+        key=lambda c: c.get("relevance_score", 0),
+        reverse=True,
+    )
+    return merged_candidates[: _sanitize_limit(top_k)]
+
+
 def fetch_profile_candidates(question_text: str, top_k: int = DEFAULT_TOP_K) -> List[Dict[str, Any]]:
     """Backward-compatible retrieval using the raw question as a single keyword."""
     question_clean = (question_text or "").strip()
@@ -198,3 +268,50 @@ def fetch_profile_candidates(question_text: str, top_k: int = DEFAULT_TOP_K) -> 
         role_keywords=keywords,
         top_k=top_k,
     )
+
+
+def fetch_profiles_by_ids(profile_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    """Fetch full profile rows for a set of `profile_id`s, preserving order.
+
+    Used by the embedding-recall branch: the FAISS index returns `profile_id`s,
+    and the ranker needs the full rows (headline, about_text, experience_json,
+    education_json, ...) the lexical path already provides.
+    """
+    cleaned_ids: List[str] = []
+    seen_ids: set = set()
+    for raw_id in profile_ids:
+        if not isinstance(raw_id, str):
+            continue
+        stripped_id = raw_id.strip()
+        if not stripped_id or stripped_id in seen_ids:
+            continue
+        seen_ids.add(stripped_id)
+        cleaned_ids.append(stripped_id)
+    if not cleaned_ids:
+        return []
+
+    placeholder_text = ", ".join(["%s"] * len(cleaned_ids))
+    sql_query = f"""
+    SELECT
+        profile_id,
+        name,
+        headline,
+        location,
+        about_text,
+        skills_count,
+        experience_count,
+        education_count,
+        experience_json,
+        education_json,
+        0 AS relevance_score
+    FROM linkedin_api_profiles_parsed
+    WHERE profile_id IN ({placeholder_text})
+    """
+
+    with _open_connection() as database_connection:
+        with database_connection.cursor() as database_cursor:
+            database_cursor.execute(sql_query, tuple(cleaned_ids))
+            query_rows = database_cursor.fetchall()
+
+    rows_by_profile_id = {str(row[0]): _row_to_candidate(row) for row in query_rows}
+    return [rows_by_profile_id[pid] for pid in cleaned_ids if pid in rows_by_profile_id]

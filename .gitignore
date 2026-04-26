@@ -42,3 +42,6 @@ Thumbs.db
 # --- Calibration loop artifacts (derived, not source of truth) ---
 reports/
 config/weights.prev.json
+
+# --- Embedding cache (rebuilt on demand by src/embeddings_index.py) ---
+.cache/

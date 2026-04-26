@@ -8,11 +8,22 @@ populated. Prints a compact pass/fail report to stdout.
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Pydantic emits cosmetic "serialized value may not be as expected" warnings
+# when langchain-openai serializes structured-output responses through its
+# callback machinery. These are upstream noise, not correctness issues, so we
+# silence them in the smoke test so pass/fail lines stay readable.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Pydantic serializer warnings:",
+    category=UserWarning,
+)
 
 from src.langgraph_app import run_recruiter_search
 
@@ -56,9 +67,23 @@ def _passed(label: str, result: dict) -> None:
     ranked = result.get("ranked_candidates") or []
     top_scores = [c.get("rank_score") for c in ranked[:3]]
     top_dimension_sample = (ranked[0].get("dimension_scores") if ranked else {}) or {}
+    error_messages = result.get("error_messages") or []
+    enrich_fired = any(msg.startswith("enrich_low_info:") for msg in error_messages)
+    rerank_fired = any(msg.startswith("listwise_rerank:") for msg in error_messages)
+    evidence_rejections = sum(
+        msg.count("rejected LLM delta") for msg in error_messages if "rejected LLM delta" in msg
+    )
+    pairwise_message = next(
+        (msg for msg in error_messages if msg.startswith("pairwise_tiebreak:")),
+        "",
+    )
+    trace_url = result.get("trace_url") or ""
     print(
         f"PASS[{label}]: candidates={len(ranked)}, top_scores={top_scores}, "
-        f"top_dims={top_dimension_sample}"
+        f"top_dims={top_dimension_sample}, enrich={enrich_fired}, "
+        f"rerank={rerank_fired}, evidence_rejects={evidence_rejections}, "
+        f"pairwise={pairwise_message or 'none'}, "
+        f"trace_url={'yes' if trace_url else 'no'}"
     )
 
 
