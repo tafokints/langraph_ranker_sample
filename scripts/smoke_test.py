@@ -37,7 +37,11 @@ REQUIRED_DIMENSION_KEYS = frozenset(
     }
 )
 
-TEST_PROMPTS = [
+PROMPTS_FIXTURE_PATH = PROJECT_ROOT / "fixtures" / "smoke_prompts.yml"
+
+# Used as a fallback if PyYAML is not installed or the YAML can't be parsed
+# — the smoke test should never silently skip prompts.
+_FALLBACK_PROMPTS = [
     {
         "label": "role-focused",
         "question": "Senior technical recruiter focused on hiring ML engineers in the US",
@@ -57,6 +61,46 @@ TEST_PROMPTS = [
         "min_experience": 2,
     },
 ]
+
+
+def _load_test_prompts() -> list:
+    """Read prompts from `fixtures/smoke_prompts.yml`, falling back to the
+    hard-coded list if PyYAML is missing or the file is malformed.
+
+    Translates the YAML schema (name/query/top_k/min_experience) onto the
+    smoke test's internal shape (label/question/top_k/min_experience) so the
+    rest of the file is unchanged.
+    """
+    if not PROMPTS_FIXTURE_PATH.exists():
+        return list(_FALLBACK_PROMPTS)
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return list(_FALLBACK_PROMPTS)
+    try:
+        with PROMPTS_FIXTURE_PATH.open("r", encoding="utf-8") as prompts_file:
+            raw_payload = yaml.safe_load(prompts_file)
+    except (OSError, yaml.YAMLError):
+        return list(_FALLBACK_PROMPTS)
+    if not isinstance(raw_payload, list):
+        return list(_FALLBACK_PROMPTS)
+
+    parsed_prompts = []
+    for raw_prompt in raw_payload:
+        if not isinstance(raw_prompt, dict) or "query" not in raw_prompt:
+            continue
+        parsed_prompts.append(
+            {
+                "label": str(raw_prompt.get("name") or "unnamed"),
+                "question": str(raw_prompt["query"]),
+                "top_k": int(raw_prompt.get("top_k", 6)),
+                "min_experience": int(raw_prompt.get("min_experience", 2)),
+            }
+        )
+    return parsed_prompts or list(_FALLBACK_PROMPTS)
+
+
+TEST_PROMPTS = _load_test_prompts()
 
 
 def _fail(label: str, reason: str) -> None:

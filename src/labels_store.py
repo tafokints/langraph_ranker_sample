@@ -226,6 +226,118 @@ def load_labels(
     return [_row_to_label(row) for row in query_rows]
 
 
+def fetch_unlabeled_candidates(
+    labeler: str,
+    limit: int = 20,
+    prefer_diverse: bool = True,
+) -> List[Dict[str, Any]]:
+    """Pick profiles this labeler has NOT yet rated, ordered for fast labeling.
+
+    Returns the same row shape as `src.retriever._row_to_candidate`
+    (profile_id, name, headline, location, about_text, *_count, *_json) so
+    the queue page can show the same candidate snippet the candidate cards
+    do.
+
+    Selection logic:
+      1. SQL-side: exclude profiles where (profile_id, labeler) already has
+         a row in `recruiter_rubric_labels`. So if you re-rate, you re-rate
+         from the cards page, not from the queue.
+      2. `prefer_diverse=True` (default): prioritize profiles with longer
+         about_text and more experience entries. The reasoning: those
+         profiles carry more signal per minute of labeler time, and their
+         labels move the calibrator more than thin profiles whose dim
+         scores are dominated by missing-data fallbacks.
+      3. `prefer_diverse=False`: random order, useful as a sanity check
+         that the diverse path isn't biasing the label distribution.
+
+    Bounded at `limit` rows so the UI can render the whole queue at once
+    in `st.session_state` without paging. Caller is expected to clamp
+    `limit` to something sane (5-50).
+
+    Notes:
+      - Read-only on `linkedin_api_profiles_parsed`; the labels schema is
+        only read via the LEFT JOIN.
+      - Skips the active-learning "label profiles where heuristic
+        disagrees with seen labels" angle for now; random-of-rich beats
+        nothing for a single-labeler workflow at this scale (50/week).
+    """
+    cleaned_labeler = (labeler or "").strip()[:MAX_LABELER_LENGTH]
+    if not cleaned_labeler:
+        raise ValueError("labeler must be non-empty")
+
+    bounded_limit = max(1, min(int(limit), 200))
+
+    ensure_labels_table()
+
+    if prefer_diverse:
+        ordering_clause = (
+            "ORDER BY "
+            "  COALESCE(p.about_char_count, LENGTH(p.about_text), 0) DESC, "
+            "  COALESCE(p.experience_count, 0) DESC, "
+            "  p.profile_id ASC"
+        )
+    else:
+        ordering_clause = "ORDER BY RAND()"
+
+    fetch_sql = f"""
+    SELECT
+        p.profile_id,
+        p.name,
+        p.headline,
+        p.location,
+        p.about_text,
+        COALESCE(p.skills_count, 0) AS skills_count,
+        COALESCE(p.experience_count, 0) AS experience_count,
+        COALESCE(p.education_count, 0) AS education_count,
+        p.experience_json,
+        p.education_json
+    FROM linkedin_api_profiles_parsed p
+    LEFT JOIN (
+        SELECT DISTINCT profile_id
+        FROM {LABELS_TABLE_NAME}
+        WHERE labeler = %s
+    ) labeled_set ON labeled_set.profile_id = p.profile_id
+    WHERE labeled_set.profile_id IS NULL
+    {ordering_clause}
+    LIMIT %s
+    """
+
+    with _open_connection() as database_connection:
+        with database_connection.cursor() as database_cursor:
+            database_cursor.execute(fetch_sql, (cleaned_labeler, bounded_limit))
+            query_rows = database_cursor.fetchall()
+
+    candidates: List[Dict[str, Any]] = []
+    for row in query_rows:
+        (
+            profile_id_value,
+            name_value,
+            headline_value,
+            location_value,
+            about_text_value,
+            skills_count_value,
+            experience_count_value,
+            education_count_value,
+            experience_json_value,
+            education_json_value,
+        ) = row
+        candidates.append(
+            {
+                "profile_id": profile_id_value,
+                "name": name_value or "",
+                "headline": headline_value or "",
+                "location": location_value or "",
+                "about_text": about_text_value or "",
+                "skills_count": int(skills_count_value or 0),
+                "experience_count": int(experience_count_value or 0),
+                "education_count": int(education_count_value or 0),
+                "experience_json": experience_json_value or "",
+                "education_json": education_json_value or "",
+            }
+        )
+    return candidates
+
+
 def count_labels(labeler: Optional[str] = None) -> int:
     """Return the number of (profile_id, labeler) pairs with at least one label.
 

@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from . import weights_loader
 from .embeddings_index import semantic_search
 from .retriever import fetch_profiles_by_ids, search_profiles
+from .schools_loader import best_school_score
 from .schemas import (
     DEFAULT_PARSED_QUERY,
     DimensionBreakdown,
@@ -76,15 +77,19 @@ LISTWISE_RERANK_TOP_K = 5        # Stage-2 listwise rerank operates on top-K onl
 EVIDENCE_FREE_DELTA_CAP = 3.0    # reject LLM dim deltas > this when no evidence quoted
 SEMANTIC_RECALL_TOP_K = 8        # embedding-search depth per retrieval call
 
-# Stage-3 pairwise tie-break: when adjacent candidates' rank_scores are within
+# Stage-3 pairwise tie-break: when nearby candidates' rank_scores are within
 # PAIRWISE_TIEBREAK_THRESHOLD of each other, ask the LLM which is better. Only
 # swap if the LLM's confidence clears PAIRWISE_TIEBREAK_MIN_CONFIDENCE.
 # Capped to PAIRWISE_TIEBREAK_MAX_CALLS per query so a long run of near-ties
-# can't explode the LLM budget.
+# can't explode the LLM budget. Compared candidates can be up to
+# PAIRWISE_TIEBREAK_MAX_GAP positions apart — gap=1 is the original adjacent
+# behavior, gap=2 catches the (rank-2, rank-4) near-tie that adjacent-only
+# would miss when ranks 3 and 4 fall between rank-2 and rank-5.
 PAIRWISE_TIEBREAK_THRESHOLD = 0.3
 PAIRWISE_TIEBREAK_MIN_CONFIDENCE = 0.6
-PAIRWISE_TIEBREAK_MAX_CALLS = 3
+PAIRWISE_TIEBREAK_MAX_CALLS = 4
 PAIRWISE_TIEBREAK_WINDOW = LISTWISE_RERANK_TOP_K  # only tie-break within top-K
+PAIRWISE_TIEBREAK_MAX_GAP = 2
 
 # Round-3 token/cost counter. Prices are USD per 1K tokens, pulled from the
 # OpenAI pricing page for gpt-4o-mini as of 2025-04. Not a billing source of
@@ -558,7 +563,14 @@ def should_enrich(state: RecruiterGraphState) -> str:
 
     Returned strings are the keys in the mapping passed to
     `StateGraph.add_conditional_edges(...)`.
+
+    The ablation harness can disable enrichment by setting
+    `feature_flags["disable_enrich_low_info"]=True` in the graph state;
+    this short-circuits to "skip" before scanning candidates.
     """
+    feature_flags = state.get("feature_flags") or {}
+    if feature_flags.get("disable_enrich_low_info"):
+        return "skip"
     candidate_profiles = state.get("candidate_profiles") or []
     for profile in candidate_profiles:
         about_text_value = str(profile.get("about_text") or "")
@@ -828,6 +840,16 @@ def _dropout_near_school(combined_text: str, school_tokens: Sequence[str]) -> bo
 
 
 def _score_education_prestige(profile: Dict[str, Any]) -> tuple:
+    """Prestige scoring on the structured `config/schools.json` corpus.
+
+    Replaces the keyword TOP_SCHOOL_TOKENS / STRONG_SCHOOL_TOKENS lists with
+    `(name, aliases, tier, country)` records plus tier base scores and
+    program modifiers (executive education, online, doctoral, graduate,
+    undergraduate). The tier-base lookup happens in
+    `src/schools_loader.py`; here we apply the existing graduation/dropout
+    guards and add the legacy degree-additive bonus on top of the structured
+    school score.
+    """
     education_blob = (profile.get("education_json") or "").lower()
     about_blob = (profile.get("about_text") or "").lower()
     combined = education_blob + " \n " + about_blob
@@ -840,26 +862,56 @@ def _score_education_prestige(profile: Dict[str, Any]) -> tuple:
     # Defer the "phd" graduation credit if it's actually a "phd student".
     phd_graduation_is_real = not _phd_is_disqualified(combined)
 
-    if _any_token_present(combined, TOP_SCHOOL_TOKENS):
-        if _dropout_near_school(combined, TOP_SCHOOL_TOKENS):
-            score += min(DROPOUT_SCHOOL_SCORE_CAP, 2.0)
-            reasons.append("top-tier school but 'dropped out' nearby -> capped")
+    school_match = best_school_score(combined)
+    if school_match is not None:
+        school_alias_tuple = (school_match["alias"],)
+        match_offset = int(school_match["offset"])
+        window_start = max(0, match_offset - DROPOUT_PROXIMITY_WINDOW)
+        window_end = match_offset + DROPOUT_PROXIMITY_WINDOW
+        nearby_text = combined[window_start:window_end]
+        is_dropout_nearby = any(
+            dropout_token in nearby_text for dropout_token in DROPOUT_TOKENS
+        )
+
+        base_school_score = float(school_match["score"])
+        program_label = school_match["program_label"]
+        is_executive_or_online_program = program_label in (
+            "executive education / part-time exec",
+            "online certificate / mooc",
+        )
+
+        if is_dropout_nearby:
+            score += min(DROPOUT_SCHOOL_SCORE_CAP, base_school_score * 0.3)
+            reasons.append(
+                f"{school_match['name']} (tier {school_match['tier']}) but "
+                "'dropped out' nearby -> capped"
+            )
+        elif is_executive_or_online_program:
+            # Executive / online programs already carry a low modifier; do
+            # NOT halve again for "no graduation signal" — the signal IS
+            # the certificate and we shouldn't double-penalize.
+            score += base_school_score
+            reasons.append(
+                f"{school_match['name']} (tier {school_match['tier']}, "
+                f"{program_label} -> x{school_match['program_modifier']:.2f})"
+            )
         elif has_graduation_signal:
-            score += 7.0
-            reasons.append("top-tier school match")
+            score += base_school_score
+            program_modifier_value = float(school_match["program_modifier"])
+            modifier_note = (
+                f", {program_label} -> x{program_modifier_value:.2f}"
+                if program_label
+                else ""
+            )
+            reasons.append(
+                f"{school_match['name']} (tier {school_match['tier']}{modifier_note})"
+            )
         else:
-            score += 3.5
-            reasons.append("top-tier school match (no graduation signal -> halved)")
-    elif _any_token_present(combined, STRONG_SCHOOL_TOKENS):
-        if _dropout_near_school(combined, STRONG_SCHOOL_TOKENS):
-            score += min(DROPOUT_SCHOOL_SCORE_CAP, 1.5)
-            reasons.append("strong school but 'dropped out' nearby -> capped")
-        elif has_graduation_signal:
-            score += 5.0
-            reasons.append("strong school match")
-        else:
-            score += 2.5
-            reasons.append("strong school match (no graduation signal -> halved)")
+            score += base_school_score * 0.5
+            reasons.append(
+                f"{school_match['name']} (tier {school_match['tier']}) "
+                "(no graduation signal -> halved)"
+            )
 
     if _any_token_present(combined, PHD_TITLE_TOKENS) and phd_graduation_is_real:
         score += 2.0
@@ -964,20 +1016,31 @@ def _aggregate_rank_score(
     return round(_clip_score(total_weighted), 2)
 
 
-def _deterministic_rank(profile: Dict[str, Any]) -> RankedCandidate:
+def _deterministic_rank(
+    profile: Dict[str, Any],
+    weights: Optional[Dict[str, float]] = None,
+    gains: Optional[Dict[str, Dict[str, float]]] = None,
+) -> RankedCandidate:
     """Baseline ranking built entirely from structured signals (no LLM).
 
     Computes the 5 dimension sub-scores, aggregates them using DIMENSION_WEIGHTS,
     and surfaces strong dimensions as match_reasons and weak high-weight dimensions
     as risks. Also serves as the fallback when the LLM path fails.
+
+    `weights` / `gains` default to the module-level DIMENSION_WEIGHTS /
+    DIMENSION_GAINS. Overrides exist so the A/B harness can run two configs
+    against the same query without restarting Python or rewriting module
+    state — see `scripts/ab_compare_weights.py`.
     """
     relevance_value = int(profile.get("relevance_score") or 0)
     experience_value = int(profile.get("experience_count") or 0)
     skills_value = int(profile.get("skills_count") or 0)
     education_value = int(profile.get("education_count") or 0)
 
+    active_weights = weights if weights is not None else DIMENSION_WEIGHTS
+
     dim_scores, dim_reasons = _compute_dimension_scores(profile)
-    overall_score = _aggregate_rank_score(dim_scores)
+    overall_score = _aggregate_rank_score(dim_scores, weights=weights, gains=gains)
 
     match_reasons: List[str] = [
         f"{DIMENSION_LABELS[key]}: {dim_scores[key]}/10 - {dim_reasons[key]}"
@@ -994,7 +1057,7 @@ def _deterministic_rank(profile: Dict[str, Any]) -> RankedCandidate:
         f"Low {DIMENSION_LABELS[key]} ({dim_scores[key]}/10)"
         for key in DIMENSION_KEYS
         if dim_scores[key] <= LOW_SCORE_RISK_THRESHOLD
-        and DIMENSION_WEIGHTS[key] >= HIGH_WEIGHT_RISK_THRESHOLD
+        and float(active_weights.get(key, 0.0)) >= HIGH_WEIGHT_RISK_THRESHOLD
     ]
 
     if overall_score <= 0:
@@ -1021,6 +1084,8 @@ def _deterministic_rank(profile: Dict[str, Any]) -> RankedCandidate:
 def _merge_llm_dimension_ranking(
     baseline_candidate: RankedCandidate,
     ranking_item: DimensionRankingItem,
+    weights: Optional[Dict[str, float]] = None,
+    gains: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Tuple[RankedCandidate, List[str]]:
     """Overlay LLM-refined dimension scores/reasons onto the deterministic baseline.
 
@@ -1061,7 +1126,7 @@ def _merge_llm_dimension_ranking(
         if reason_text:
             merged_reasons[dimension_key] = reason_text
 
-    refined_overall = _aggregate_rank_score(merged_scores)
+    refined_overall = _aggregate_rank_score(merged_scores, weights=weights, gains=gains)
     match_reasons = _ensure_string_list(ranking_item.match_reasons) or baseline_candidate["match_reasons"]
     risks = _ensure_string_list(ranking_item.risks)
 
@@ -1233,13 +1298,22 @@ def _pairwise_tiebreak_adjacent(
     ranked_candidates: List[RankedCandidate],
     question_text: str,
 ) -> Tuple[List[RankedCandidate], int, int]:
-    """Stage-3: adjacent-pair tie-break on near-ties within the top window.
+    """Stage-3: tie-break near-ties within the top window.
 
-    For each consecutive pair (i, i+1) whose rank_score gap is below
+    Originally adjacent-only (i, i+1). As of Round 4 the helper also walks
+    pairs up to `PAIRWISE_TIEBREAK_MAX_GAP` positions apart so a (rank-2,
+    rank-4) near-tie isn't blocked when ranks 3 and 4 fall between rank-2
+    and rank-5 with their own near-ties. Smaller gaps are processed first
+    so the budget is spent on the most plausible swaps.
+
+    For each pair whose rank_score gap is below
     `PAIRWISE_TIEBREAK_THRESHOLD`, issue one structured-output call. If the
     LLM picks the lower-ranked candidate with confidence >=
     `PAIRWISE_TIEBREAK_MIN_CONFIDENCE`, swap them. Budget-capped by
-    `PAIRWISE_TIEBREAK_MAX_CALLS`.
+    `PAIRWISE_TIEBREAK_MAX_CALLS` total LLM calls across all gaps.
+
+    The function name is preserved for back-compat with existing imports;
+    behavior is now "tie-break within window", not adjacent-only.
 
     Returns (new_ranking, calls_made, swaps_applied).
     """
@@ -1262,61 +1336,69 @@ def _pairwise_tiebreak_adjacent(
         "confidence in [0, 1]."
     )
 
-    pair_index = 0
-    while pair_index < window_end - 1 and calls_made < PAIRWISE_TIEBREAK_MAX_CALLS:
-        higher_candidate = working_list[pair_index]
-        lower_candidate = working_list[pair_index + 1]
-        score_gap = abs(
-            float(higher_candidate.get("rank_score") or 0.0)
-            - float(lower_candidate.get("rank_score") or 0.0)
-        )
-        if score_gap >= PAIRWISE_TIEBREAK_THRESHOLD:
-            pair_index += 1
-            continue
-
-        pair_payload = {
-            "role_brief": question_text,
-            "candidate_a": _candidate_snippet_for_pairwise(higher_candidate),
-            "candidate_b": _candidate_snippet_for_pairwise(lower_candidate),
-        }
-        user_message = (
-            "Pick the stronger of these two near-tie candidates.\n"
-            f"{json.dumps(pair_payload, ensure_ascii=False)}\n"
-        )
-        try:
-            pairwise_decision: PairwiseDecision = structured_llm.invoke(
-                [("system", system_instructions), ("human", user_message)],
-                _llm_invoke_config(),
+    # Process smaller gaps first so we exhaust the budget on the most likely
+    # swaps. We re-read working_list[anchor_index] / working_list[partner_index]
+    # on every iteration so a swap from a smaller gap is reflected before
+    # we evaluate a larger-gap pair that overlaps it.
+    for gap in range(1, PAIRWISE_TIEBREAK_MAX_GAP + 1):
+        anchor_index = 0
+        while (
+            anchor_index < window_end - gap
+            and calls_made < PAIRWISE_TIEBREAK_MAX_CALLS
+        ):
+            higher_candidate = working_list[anchor_index]
+            lower_candidate = working_list[anchor_index + gap]
+            score_gap = abs(
+                float(higher_candidate.get("rank_score") or 0.0)
+                - float(lower_candidate.get("rank_score") or 0.0)
             )
-        except (ValidationError, ValueError, TypeError):
-            # Fall back to the pointwise order for this pair; don't fail the
-            # whole run because of one structured-output hiccup.
-            pair_index += 1
-            calls_made += 1
-            continue
-        except Exception:  # noqa: BLE001 - network/auth; keep the pairwise optional.
-            pair_index += 1
-            calls_made += 1
-            continue
+            if score_gap >= PAIRWISE_TIEBREAK_THRESHOLD:
+                anchor_index += 1
+                continue
 
-        calls_made += 1
-        winner_id = (pairwise_decision.winner_profile_id or "").strip()
-        lower_candidate_id = lower_candidate["profile_id"]
-        higher_candidate_id = higher_candidate["profile_id"]
-        should_swap = (
-            winner_id == lower_candidate_id
-            and winner_id != higher_candidate_id
-            and pairwise_decision.confidence >= PAIRWISE_TIEBREAK_MIN_CONFIDENCE
-        )
-        if should_swap:
-            working_list[pair_index], working_list[pair_index + 1] = (
-                lower_candidate,
-                higher_candidate,
+            pair_payload = {
+                "role_brief": question_text,
+                "candidate_a": _candidate_snippet_for_pairwise(higher_candidate),
+                "candidate_b": _candidate_snippet_for_pairwise(lower_candidate),
+            }
+            user_message = (
+                "Pick the stronger of these two near-tie candidates.\n"
+                f"{json.dumps(pair_payload, ensure_ascii=False)}\n"
             )
-            swaps_applied += 1
-        # Always advance. Re-asking (lower, higher) right after a swap just
-        # burns budget to re-confirm the decision we already made.
-        pair_index += 1
+            try:
+                pairwise_decision: PairwiseDecision = structured_llm.invoke(
+                    [("system", system_instructions), ("human", user_message)],
+                    _llm_invoke_config(),
+                )
+            except (ValidationError, ValueError, TypeError):
+                # Fall back to the pointwise order for this pair; don't fail
+                # the whole run because of one structured-output hiccup.
+                anchor_index += 1
+                calls_made += 1
+                continue
+            except Exception:  # noqa: BLE001 - network/auth; keep pairwise optional.
+                anchor_index += 1
+                calls_made += 1
+                continue
+
+            calls_made += 1
+            winner_id = (pairwise_decision.winner_profile_id or "").strip()
+            lower_candidate_id = lower_candidate["profile_id"]
+            higher_candidate_id = higher_candidate["profile_id"]
+            should_swap = (
+                winner_id == lower_candidate_id
+                and winner_id != higher_candidate_id
+                and pairwise_decision.confidence >= PAIRWISE_TIEBREAK_MIN_CONFIDENCE
+            )
+            if should_swap:
+                working_list[anchor_index], working_list[anchor_index + gap] = (
+                    lower_candidate,
+                    higher_candidate,
+                )
+                swaps_applied += 1
+            # Always advance. Re-asking (lower, higher) right after a swap
+            # just burns budget to re-confirm a decision we already made.
+            anchor_index += 1
 
     return working_list, calls_made, swaps_applied
 
@@ -1337,9 +1419,16 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
 
     capped_candidates = candidate_profiles[:MAX_RANKING_CANDIDATES]
 
+    weights_override_value = state.get("weights_override")
+    gains_override_value = state.get("gains_override")
+
     baseline_by_profile_id: Dict[str, RankedCandidate] = {}
     for profile in capped_candidates:
-        baseline_candidate = _deterministic_rank(profile)
+        baseline_candidate = _deterministic_rank(
+            profile,
+            weights=weights_override_value,
+            gains=gains_override_value,
+        )
         baseline_by_profile_id[baseline_candidate["profile_id"]] = baseline_candidate
 
     llm_model = _build_llm()
@@ -1376,7 +1465,10 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
         if profile_key not in baseline_by_profile_id:
             continue
         merged_candidate, rejection_messages = _merge_llm_dimension_ranking(
-            baseline_by_profile_id[profile_key], ranking_item
+            baseline_by_profile_id[profile_key],
+            ranking_item,
+            weights=weights_override_value,
+            gains=gains_override_value,
         )
         baseline_by_profile_id[profile_key] = merged_candidate
         total_rejections += len(rejection_messages)
@@ -1390,35 +1482,46 @@ def rank_candidates_node(state: RecruiterGraphState) -> RecruiterGraphState:
         baseline_by_profile_id.values(), key=lambda c: c["rank_score"], reverse=True
     )
 
-    try:
-        ranked_candidates, rerank_rationale = _listwise_rerank_top_k(
-            llm_model=llm_model,
-            ranked_candidates=pointwise_ranked,
-            question_text=state.get("question_text", ""),
-        )
-        if rerank_rationale:
-            _append_error(state, f"listwise_rerank: {rerank_rationale}")
-    except (ValidationError, ValueError, TypeError) as rerank_error:
-        _append_error(state, f"listwise_rerank fallback: {rerank_error}")
-        ranked_candidates = pointwise_ranked
-    except Exception as rerank_network_error:  # noqa: BLE001
-        _append_error(state, f"listwise_rerank LLM error: {rerank_network_error}")
-        ranked_candidates = pointwise_ranked
+    feature_flags = state.get("feature_flags") or {}
+    disable_listwise = bool(feature_flags.get("disable_listwise_rerank"))
+    disable_pairwise = bool(feature_flags.get("disable_pairwise_tiebreak"))
 
-    # Stage-3: adjacent pairwise tie-break on near-ties in the top window.
-    try:
-        ranked_candidates, pairwise_calls, pairwise_swaps = _pairwise_tiebreak_adjacent(
-            llm_model=llm_model,
-            ranked_candidates=ranked_candidates,
-            question_text=state.get("question_text", ""),
-        )
-        if pairwise_calls:
-            _append_error(
-                state,
-                f"pairwise_tiebreak: {pairwise_calls} call(s), {pairwise_swaps} swap(s).",
+    if disable_listwise:
+        _append_error(state, "listwise_rerank disabled by feature_flags.")
+        ranked_candidates = pointwise_ranked
+    else:
+        try:
+            ranked_candidates, rerank_rationale = _listwise_rerank_top_k(
+                llm_model=llm_model,
+                ranked_candidates=pointwise_ranked,
+                question_text=state.get("question_text", ""),
             )
-    except Exception as pairwise_error:  # noqa: BLE001 - optional stage, never block
-        _append_error(state, f"pairwise_tiebreak skipped: {pairwise_error}")
+            if rerank_rationale:
+                _append_error(state, f"listwise_rerank: {rerank_rationale}")
+        except (ValidationError, ValueError, TypeError) as rerank_error:
+            _append_error(state, f"listwise_rerank fallback: {rerank_error}")
+            ranked_candidates = pointwise_ranked
+        except Exception as rerank_network_error:  # noqa: BLE001
+            _append_error(state, f"listwise_rerank LLM error: {rerank_network_error}")
+            ranked_candidates = pointwise_ranked
+
+    # Stage-3: pairwise tie-break on near-ties in the top window.
+    if disable_pairwise:
+        _append_error(state, "pairwise_tiebreak disabled by feature_flags.")
+    else:
+        try:
+            ranked_candidates, pairwise_calls, pairwise_swaps = _pairwise_tiebreak_adjacent(
+                llm_model=llm_model,
+                ranked_candidates=ranked_candidates,
+                question_text=state.get("question_text", ""),
+            )
+            if pairwise_calls:
+                _append_error(
+                    state,
+                    f"pairwise_tiebreak: {pairwise_calls} call(s), {pairwise_swaps} swap(s).",
+                )
+        except Exception as pairwise_error:  # noqa: BLE001 - optional stage, never block
+            _append_error(state, f"pairwise_tiebreak skipped: {pairwise_error}")
 
     state["ranked_candidates"] = ranked_candidates
     return state
@@ -1542,9 +1645,23 @@ def run_recruiter_search(
     question_text: str,
     top_k: int = 8,
     min_experience_entries: int = 0,
+    weights_override: Optional[Dict[str, float]] = None,
+    gains_override: Optional[Dict[str, Dict[str, float]]] = None,
+    feature_flags: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     """Top-level entry point. Wrapped in `@traceable` so LangSmith captures
     the whole run as a single trace tree, with each node as a child run.
+
+    `weights_override` / `gains_override` let the A/B harness
+    (`scripts/ab_compare_weights.py`) compare two configurations against the
+    same prompt without restarting Python or rewriting module-level state.
+    None / missing -> use whatever `config/weights.json` resolved to at
+    import time (or the defaults).
+
+    `feature_flags` lets the ablation harness (`scripts/ablation_table.py`)
+    disable individual graph stages — listwise rerank, enrich_low_info,
+    pairwise tie-break — so we can isolate each feature's contribution. The
+    expected keys are documented on `RecruiterGraphState.feature_flags`.
     """
     compiled_graph = build_graph()
     initial_state: RecruiterGraphState = {
@@ -1557,6 +1674,20 @@ def run_recruiter_search(
         "shortlist_summary": "",
         "error_messages": [],
     }
+    if weights_override is not None:
+        initial_state["weights_override"] = dict(weights_override)
+    if gains_override is not None:
+        initial_state["gains_override"] = {
+            str(key): {
+                "gain": float(entry.get("gain", 1.0)),
+                "bias": float(entry.get("bias", 0.0)),
+            }
+            for key, entry in gains_override.items()
+        }
+    if feature_flags:
+        initial_state["feature_flags"] = {
+            str(key): bool(value) for key, value in feature_flags.items()
+        }
 
     # Install a per-run token collector so the UI can surface a ballpark
     # cost without a LangSmith API round-trip. We append/pop instead of

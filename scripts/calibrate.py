@@ -54,7 +54,11 @@ from src.weights_loader import (
     BIAS_MIN,
     GAIN_MAX,
     GAIN_MIN,
+    archive_weights_snapshot,
     default_dimension_gains,
+    find_most_recent_archive,
+    load_gains,
+    load_weights,
     next_version,
     save_weights,
     weights_file_path,
@@ -589,6 +593,76 @@ def _format_weights_block(label: str, weights: Dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+DRIFT_SIGNIFICANT_WEIGHT_DELTA = 0.02
+DRIFT_SIGNIFICANT_GAIN_DELTA = 0.05
+DRIFT_SIGNIFICANT_BIAS_DELTA = 0.10
+
+
+def _format_drift_section(
+    previous_archive_path: Path,
+    previous_weights: Dict[str, float],
+    previous_gains: Dict[str, Dict[str, float]],
+    new_weights: Dict[str, float],
+    new_gains: Dict[str, Dict[str, float]],
+) -> List[str]:
+    """Format a "Drift since last fit" section comparing newly fit weights+gains
+    against the most-recent archived snapshot.
+
+    The thresholds (`DRIFT_SIGNIFICANT_*`) tag a row as a "shift" when the change
+    is large enough that it would actually alter rankings. Sub-threshold deltas
+    are still printed (we never hide numbers), they just don't get the marker.
+    """
+    section_lines: List[str] = []
+    section_lines.append("## Drift since last fit")
+    section_lines.append("")
+    section_lines.append(
+        f"Comparing the just-written weights against the previous archived "
+        f"fit at `{previous_archive_path.relative_to(PROJECT_ROOT)}`. "
+        f"A row is flagged when the change is large enough to plausibly move "
+        f"the top-K ranking."
+    )
+    section_lines.append("")
+    section_lines.append(
+        "| Dimension | Weight prev → new (Δ) | Gain prev → new (Δ) | "
+        "Bias prev → new (Δ) | Shift? |"
+    )
+    section_lines.append("|---|---|---|---|---|")
+
+    for dimension_key in DIMENSION_KEYS:
+        prev_weight_value = float(previous_weights.get(dimension_key, 0.0))
+        new_weight_value = float(new_weights.get(dimension_key, 0.0))
+        weight_delta = new_weight_value - prev_weight_value
+
+        prev_gain_entry = previous_gains.get(dimension_key, {"gain": 1.0, "bias": 0.0})
+        new_gain_entry = new_gains.get(dimension_key, {"gain": 1.0, "bias": 0.0})
+        prev_gain_value = float(prev_gain_entry.get("gain", 1.0))
+        new_gain_value = float(new_gain_entry.get("gain", 1.0))
+        gain_delta = new_gain_value - prev_gain_value
+
+        prev_bias_value = float(prev_gain_entry.get("bias", 0.0))
+        new_bias_value = float(new_gain_entry.get("bias", 0.0))
+        bias_delta = new_bias_value - prev_bias_value
+
+        shift_markers: List[str] = []
+        if abs(weight_delta) >= DRIFT_SIGNIFICANT_WEIGHT_DELTA:
+            shift_markers.append("weight")
+        if abs(gain_delta) >= DRIFT_SIGNIFICANT_GAIN_DELTA:
+            shift_markers.append("gain")
+        if abs(bias_delta) >= DRIFT_SIGNIFICANT_BIAS_DELTA:
+            shift_markers.append("bias")
+        shift_cell = ", ".join(shift_markers) if shift_markers else "-"
+
+        section_lines.append(
+            f"| {DIMENSION_LABELS.get(dimension_key, dimension_key)} "
+            f"| {prev_weight_value:.4f} → {new_weight_value:.4f} ({weight_delta:+.4f}) "
+            f"| {prev_gain_value:.3f} → {new_gain_value:.3f} ({gain_delta:+.3f}) "
+            f"| {prev_bias_value:+.3f} → {new_bias_value:+.3f} ({bias_delta:+.3f}) "
+            f"| {shift_cell} |"
+        )
+    section_lines.append("")
+    return section_lines
+
+
 def _write_report(
     report_lines: List[str],
     report_timestamp: datetime,
@@ -796,6 +870,17 @@ def main() -> int:
         )
         return 0
 
+    previous_archive_path = find_most_recent_archive()
+    previous_archive_weights: Optional[Dict[str, float]] = None
+    previous_archive_gains: Optional[Dict[str, Dict[str, float]]] = None
+    if previous_archive_path is not None:
+        previous_archive_weights = load_weights(
+            DEFAULT_DIMENSION_WEIGHTS, path=previous_archive_path
+        )
+        previous_archive_gains = load_gains(
+            DEFAULT_DIMENSION_WEIGHTS, path=previous_archive_path
+        )
+
     new_version = next_version()
     save_weights(
         weights=fitted_weights,
@@ -807,7 +892,35 @@ def main() -> int:
         labeler=cli_args.labeler,
         gains=fitted_gains,
     )
+    archive_path = archive_weights_snapshot(timestamp=report_timestamp)
     report_lines.append(f"Wrote `{weights_file_path()}` (version `{new_version}`).")
+    if archive_path is not None:
+        report_lines.append(
+            f"Archived snapshot to `{archive_path.relative_to(PROJECT_ROOT)}`."
+        )
+    report_lines.append("")
+
+    if (
+        previous_archive_path is not None
+        and previous_archive_weights is not None
+        and previous_archive_gains is not None
+    ):
+        report_lines.extend(
+            _format_drift_section(
+                previous_archive_path=previous_archive_path,
+                previous_weights=previous_archive_weights,
+                previous_gains=previous_archive_gains,
+                new_weights=fitted_weights,
+                new_gains=fitted_gains,
+            )
+        )
+    else:
+        report_lines.append(
+            "No prior archived weights snapshot found; skipping drift section. "
+            "Future fits will include a Drift since last fit table."
+        )
+        report_lines.append("")
+
     report_path = _write_report(report_lines, report_timestamp)
 
     print(

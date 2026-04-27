@@ -78,6 +78,18 @@ class RecruiterGraphState(TypedDict, total=False):
     shortlist_summary: str
     error_messages: List[str]
     trace_url: str
+    # Optional per-run override of DIMENSION_WEIGHTS / DIMENSION_GAINS; the
+    # A/B harness (`scripts/ab_compare_weights.py`) sets these so two runs
+    # can swap configs without restarting the process or rewriting the
+    # module-level constants. None / missing -> use module defaults.
+    weights_override: Dict[str, float]
+    gains_override: Dict[str, Dict[str, float]]
+    # Optional per-run feature flags for the ablation harness
+    # (`scripts/ablation_table.py`). Each key maps a graph-stage name to a
+    # boolean; True means "skip that stage and fall back to deterministic
+    # behavior". Missing keys preserve the default behavior so production
+    # paths are unaffected.
+    feature_flags: Dict[str, bool]
 
 
 DEFAULT_PARSED_QUERY: ParsedQuery = {

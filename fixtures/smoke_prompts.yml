@@ -1,0 +1,85 @@
+# Smoke + snapshot prompts for the recruiter graph.
+#
+# Loaded by:
+#   - scripts/smoke_test.py            (live LLM/DB end-to-end test)
+#   - scripts/ab_compare_weights.py    (A/B comparison harness)
+#   - tests/test_ranking_snapshots.py  (offline regression test on
+#                                       deterministic-only ranking)
+#
+# Schema:
+#   - name (str)             short identifier surfaced in CLI output
+#   - query (str)            recruiter brief fed into run_recruiter_search
+#   - top_k (int)            how many candidates to retrieve (default: 6)
+#   - min_experience (int)   filter on experience entries (default: 2)
+#   - notes (str, optional)  free-text rationale for what this prompt
+#                             is supposed to exercise
+#
+# Notes:
+#   - Keep the list short. Every entry costs N LLM calls per smoke run.
+#   - Adding a prompt is the cheap way to probe a weak spot in the
+#     scorers — see "Iteration playbook -> Loop 3 monthly" in README.
+- name: role-focused
+  query: "Senior technical recruiter focused on hiring ML engineers in the US"
+  top_k: 6
+  min_experience: 3
+  notes: "Probes role-keyword routing and US-region location fallback"
+
+- name: skill-focused
+  query: "Unity game developer with C# experience and shipped mobile titles"
+  top_k: 6
+  min_experience: 2
+  notes: "Probes skill keyword matching for non-obvious tech (Unity, C#)"
+
+- name: location-focused
+  query: "Product designer based in the Bay Area with fintech background"
+  top_k: 6
+  min_experience: 2
+  notes: "Probes SF location fit + soft fintech industry signal"
+
+# --- Held-out prompts for Round 4 ablation table ---
+# These extend the smoke fixture to ~10 prompts so the ablation harness
+# (`scripts/ablation_table.py`) has a meaningful base. They are NOT covered
+# by `tests/test_ranking_snapshots.py` PROMPT_EXPECTATIONS — that's
+# intentional: the snapshot test is for fast regression checks on prompts
+# we have ground-truth for; ablation prompts probe broader coverage.
+- name: founder-focused
+  query: "Repeat founder building an AI startup; YC alum preferred"
+  top_k: 6
+  min_experience: 4
+  notes: "Probes founder_experience scorer (CEO/CTO titles + YC context)"
+
+- name: research-heavy
+  query: "AI research scientist with publications at NeurIPS or ICML"
+  top_k: 6
+  min_experience: 3
+  notes: "Probes phd_researcher scorer (publication signals)"
+
+- name: backend-engineer
+  query: "Senior backend engineer with 5+ years building distributed systems in Go or Rust"
+  top_k: 6
+  min_experience: 5
+  notes: "Probes technical_background with niche-language tokens"
+
+- name: education-prestige
+  query: "Hire an Ivy League graduate with engineering background"
+  top_k: 6
+  min_experience: 2
+  notes: "Probes education_prestige tier-1 detection (Harvard, Princeton, Yale, etc.)"
+
+- name: non-us-talent
+  query: "Top-tier ML engineer based in London or Zurich, willing to relocate to SF"
+  top_k: 6
+  min_experience: 3
+  notes: "Probes non-US schools (Oxford, ETH) + sf_location_fit relocate signal"
+
+- name: junior-tech
+  query: "Junior frontend engineer, 1-2 years experience, React and TypeScript"
+  top_k: 6
+  min_experience: 1
+  notes: "Probes filter on min_experience + skill matches at low experience"
+
+- name: mixed-criteria
+  query: "Product engineer in San Francisco who has founded a company and went to Stanford or MIT"
+  top_k: 6
+  min_experience: 3
+  notes: "Probes balanced multi-dimension fit (no single spike wins)"

@@ -1,0 +1,43 @@
+# Round 4 ablation table
+
+- Prompts: 10 (C:\Users\danie\testing_langchain\fixtures\smoke_prompts.yml)
+- Configs: 5
+- Top-K compared: 3
+
+[1/10] role-focused: running 5 configs ...
+[2/10] skill-focused: running 5 configs ...
+[3/10] location-focused: running 5 configs ...
+[4/10] founder-focused: running 5 configs ...
+[5/10] research-heavy: running 5 configs ...
+[6/10] backend-engineer: running 5 configs ...
+[7/10] education-prestige: running 5 configs ...
+[8/10] non-us-talent: running 5 configs ...
+[9/10] junior-tech: running 5 configs ...
+[10/10] mixed-criteria: running 5 configs ...
+
+## Round 4 ablation summary (top-3 Jaccard vs full pipeline)
+
+| # | configuration | mean Jaccard vs full pipeline |
+|---|---|---|
+| 1 | baseline (no rerank, no enrich, no pairwise, weights v1) | 0.80 |
+| 2 | + listwise rerank | 0.80 |
+| 3 | + enrich_low_info | 0.80 |
+| 4 | + pairwise tie-break | 0.70 |
+| 5 | + v2 weights (fitted) | 1.00 |
+
+_n = 10 prompts; reference = full pipeline (row 5)._
+
+## Per-prompt top-K by configuration
+
+| prompt| top-3 baseline (no rerank, no enrich, no pairwise, weights v1)| top-3 + listwise rerank| top-3 + enrich_low_info| top-3 + pairwise tie-break| top-3 + v2 weights (fitted) |
+|---|---|---|---|---|---|
+| role-focused| levbszabo, ldavemendoza, deepak-rathi| ldavemendoza, levbszabo, deepak-rathi| ldavemendoza, levbszabo, deepak-rathi| ldavemendoza, levbszabo, deepak-rathi| levbszabo, justinjcli, deepak-rathi |
+| skill-focused| kimahl, aaron-carr, flo28rin| kimahl, flo28rin, aaron-carr| kimahl, aaron-carr, josephprog| kimahl, flo28rin, aaron-carr| kimahl, aaron-carr, connorjamesroberts |
+| location-focused| preetibhargava, gargee-shah, karen-dougherty-a9b39920| preetibhargava, gargee-shah, karen-dougherty-a9b39920| preetibhargava, gargee-shah, karen-dougherty-a9b39920| chopra, brunosartoriquadros, rmtwrkr| preetibhargava, gargee-shah, karen-dougherty-a9b39920 |
+| founder-focused| aimlengineer, guillaumeluccisano, ryanlebon| aimlengineer, guillaumeluccisano, ryanlebon| aimlengineer, guillaumeluccisano, ryanlebon| aimlengineer, guillaumeluccisano, ryanlebon| aimlengineer, guillaumeluccisano, ryanlebon |
+| research-heavy| preetibhargava, rosanne-liu-378a98a, yilin-tsai| preetibhargava, rosanne-liu-378a98a, yilin-tsai| preetibhargava, rosanne-liu-378a98a, yilin-tsai| preetibhargava, rosanne-liu-378a98a, yilin-tsai| preetibhargava, rosanne-liu-378a98a, yilin-tsai |
+| backend-engineer| prabal1997, thomas-holloway, gauriborse| prabal1997, thomas-holloway, gauriborse| prabal1997, thomas-holloway, gauriborse| prabal1997, thomas-holloway, gauriborse| prabal1997, thomas-holloway, gauriborse |
+| education-prestige| xuejunwang, sandeepvijayarao, n-anchan| xuejunwang, sandeepvijayarao, n-anchan| xuejunwang, vrinda-ahuja, sandeepvijayarao| xuejunwang, sandeepvijayarao, n-anchan| xuejunwang, sandeepvijayarao, pavan-kumar-v-86b30828a |
+| non-us-talent| levbszabo, wayne-shi, deepak-rathi| levbszabo, wayne-shi, deepak-rathi| levbszabo, wayne-shi, deepak-rathi| levbszabo, wayne-shi, deepak-rathi| levbszabo, wayne-shi, deepak-rathi |
+| junior-tech| chandan-paramesh-808714366, tej-jaideep-patel, alejandrobay| chandan-paramesh-808714366, tej-jaideep-patel, alejandrobay| chandan-paramesh-808714366, tej-jaideep-patel, alejandrobay| chandan-paramesh-808714366, tej-jaideep-patel, alejandrobay| chandan-paramesh-808714366, alejandrobay, tej-jaideep-patel |
+| mixed-criteria| michaeleugeneng, jeanxin, john-ho-01866285| michaeleugeneng, jeanxin, john-ho-01866285| jeanxin, michaeleugeneng, john-ho-01866285| michaeleugeneng, jeanxin, john-ho-01866285| michaeleugeneng, jeanxin, chaudhary-cs |

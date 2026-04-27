@@ -16,6 +16,7 @@ import pytest
 
 from src.langgraph_app import (
     PAIRWISE_TIEBREAK_MAX_CALLS,
+    PAIRWISE_TIEBREAK_MAX_GAP,
     PAIRWISE_TIEBREAK_MIN_CONFIDENCE,
     PAIRWISE_TIEBREAK_THRESHOLD,
     _pairwise_tiebreak_adjacent,
@@ -200,6 +201,107 @@ def test_single_candidate_is_noop() -> None:
     assert [c["profile_id"] for c in new_ranking] == ["A"]
     assert calls_made == 0
     assert swaps_applied == 0
+
+
+def test_non_adjacent_swap_when_gap_two_pair_is_near_tie() -> None:
+    """Round 4 case: rank-1 = 5.00, rank-2 = 4.85, rank-3 = 4.75. The (1, 2)
+    pair is a near-tie (gap 0.15) and so is (1, 3) (gap 0.25). Adjacent-only
+    would compare (1, 2) and (2, 3); the new behavior must also evaluate
+    the (1, 3) pair so a stronger rank-3 can leapfrog rank-1 even when
+    rank-2 was decided to stay put.
+
+    Decisions, in order:
+    - gap=1, (A=5.00, B=4.85) -> keep A.
+    - gap=1, (B=4.85, C=4.75) -> keep B.
+    - gap=2, (A=5.00, C=4.75) -> swap to C wins (the new pair).
+    """
+    assert PAIRWISE_TIEBREAK_MAX_GAP >= 2
+
+    ranked = [
+        _candidate("A", 5.00),
+        _candidate("B", 4.85),
+        _candidate("C", 4.75),
+    ]
+    stub_model = _StubChatModel(
+        [
+            PairwiseDecision(
+                winner_profile_id="A", rationale="adjacent-keep", confidence=0.9
+            ),
+            PairwiseDecision(
+                winner_profile_id="B", rationale="adjacent-keep", confidence=0.9
+            ),
+            PairwiseDecision(
+                winner_profile_id="C", rationale="non-adjacent flip", confidence=0.9
+            ),
+        ]
+    )
+
+    new_ranking, calls_made, swaps_applied = _pairwise_tiebreak_adjacent(
+        llm_model=stub_model,  # type: ignore[arg-type]
+        ranked_candidates=ranked,
+        question_text="role brief",
+    )
+
+    assert calls_made == 3
+    assert swaps_applied == 1
+    # After the (A, C) swap the order should be [C, B, A].
+    assert [candidate["profile_id"] for candidate in new_ranking] == ["C", "B", "A"]
+
+
+def test_non_adjacent_pair_skipped_when_gap_score_above_threshold() -> None:
+    """Even if MAX_GAP=2 is allowed, a (i, i+2) pair whose rank-score gap
+    is bigger than PAIRWISE_TIEBREAK_THRESHOLD must NOT call the LLM.
+    Otherwise we'd waste budget on hopeless swaps."""
+    ranked = [
+        _candidate("A", 5.00),
+        _candidate("B", 4.85),  # gap from A: 0.15 (near-tie)
+        _candidate("C", 4.40),  # gap from A: 0.60 (NOT a near-tie)
+    ]
+    stub_model = _StubChatModel(
+        [
+            PairwiseDecision(
+                winner_profile_id="A", rationale="keep", confidence=0.9
+            ),
+            # (B, C) gap = 0.45 (>0.3) -> skipped, no decision needed.
+            # (A, C) gap = 0.60 (>0.3) -> skipped, no decision needed.
+        ]
+    )
+
+    _, calls_made, swaps_applied = _pairwise_tiebreak_adjacent(
+        llm_model=stub_model,  # type: ignore[arg-type]
+        ranked_candidates=ranked,
+        question_text="role brief",
+    )
+
+    assert calls_made == 1
+    assert swaps_applied == 0
+
+
+def test_budget_cap_respected_across_gap_passes() -> None:
+    """The MAX_CALLS cap is *total* across gap=1 and gap=2 passes; the
+    larger-gap pass must NOT add fresh budget."""
+    assert PAIRWISE_TIEBREAK_MAX_CALLS == 4
+
+    # 6 candidates with all near-ties (steps of 0.05): plenty of
+    # eligible pairs at gap=1 and gap=2.
+    ranked = [_candidate(chr(ord("A") + i), 5.0 - 0.05 * i) for i in range(6)]
+    decisions = [
+        PairwiseDecision(
+            winner_profile_id=chr(ord("A") + position_index),
+            rationale="keep",
+            confidence=0.9,
+        )
+        for position_index in range(PAIRWISE_TIEBREAK_MAX_CALLS)
+    ]
+    stub_model = _StubChatModel(decisions)
+
+    _, calls_made, _ = _pairwise_tiebreak_adjacent(
+        llm_model=stub_model,  # type: ignore[arg-type]
+        ranked_candidates=ranked,
+        question_text="role brief",
+    )
+
+    assert calls_made <= PAIRWISE_TIEBREAK_MAX_CALLS
 
 
 if __name__ == "__main__":

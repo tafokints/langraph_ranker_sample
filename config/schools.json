@@ -1,0 +1,381 @@
+{
+  "version": 1,
+  "_comment": "Structured corpus replacing the keyword TOP_SCHOOL_TOKENS / STRONG_SCHOOL_TOKENS lists in src/langgraph_app.py. Tier 1 = top global research universities and equivalent. Tier 2 = strong tech-heavy or top-50 globally. Tier 3 = selective/regional with material employer recognition. tier_base_scores are added to the prestige score; program_modifiers multiply the matched school's contribution to penalize executive/online programs and reward graduate study.",
+  "tier_base_scores": {
+    "1": 7.0,
+    "2": 5.0,
+    "3": 3.5
+  },
+  "default_program_signal": 1.0,
+  "program_modifier_window": 80,
+  "program_modifiers": [
+    {
+      "label": "executive education / part-time exec",
+      "tokens": [
+        "executive education",
+        "executive program",
+        "executive certificate",
+        "part-time executive",
+        "part time executive",
+        "exec ed",
+        "exec mba",
+        "executive mba"
+      ],
+      "modifier": 0.45
+    },
+    {
+      "label": "online certificate / mooc",
+      "tokens": [
+        "online certificate",
+        "online cert",
+        "coursera",
+        "edx",
+        "professional certificate",
+        "summer program",
+        "summer school"
+      ],
+      "modifier": 0.4
+    },
+    {
+      "label": "doctoral",
+      "tokens": [
+        "phd",
+        "ph.d",
+        "doctorate",
+        "doctoral",
+        "d.phil"
+      ],
+      "modifier": 1.1
+    },
+    {
+      "label": "graduate (masters/mba)",
+      "tokens": [
+        "master of",
+        "master's",
+        "masters",
+        "m.s.",
+        "m.sc",
+        "msc ",
+        "m.eng",
+        "mba",
+        "j.d.",
+        "jd "
+      ],
+      "modifier": 1.0
+    },
+    {
+      "label": "undergraduate",
+      "tokens": [
+        "bachelor of",
+        "bachelor's",
+        "bachelors",
+        "b.s.",
+        "b.sc",
+        "bsc ",
+        "b.eng",
+        "b.a.",
+        "ba ",
+        "undergrad"
+      ],
+      "modifier": 1.0
+    }
+  ],
+  "schools": [
+    {
+      "name": "Stanford University",
+      "aliases": ["stanford", "stanford university", "stanford gsb"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Massachusetts Institute of Technology",
+      "aliases": ["mit", "massachusetts institute of technology", "mit sloan"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Harvard University",
+      "aliases": ["harvard", "harvard university", "harvard business school", "hbs"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Princeton University",
+      "aliases": ["princeton", "princeton university"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Yale University",
+      "aliases": ["yale", "yale university"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "UC Berkeley",
+      "aliases": ["uc berkeley", "u.c. berkeley", "berkeley", "university of california, berkeley", "uc-berkeley"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "California Institute of Technology",
+      "aliases": ["caltech", "california institute of technology"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Carnegie Mellon University",
+      "aliases": ["carnegie mellon", "cmu"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Cornell University",
+      "aliases": ["cornell", "cornell university"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Columbia University",
+      "aliases": ["columbia university", "columbia business school"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "University of Chicago",
+      "aliases": ["university of chicago", "uchicago", "chicago booth"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "University of Pennsylvania",
+      "aliases": ["upenn", "university of pennsylvania", "wharton"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "Johns Hopkins University",
+      "aliases": ["johns hopkins", "johns hopkins university"],
+      "tier": 1,
+      "country": "US"
+    },
+    {
+      "name": "University of Oxford",
+      "aliases": ["oxford", "university of oxford"],
+      "tier": 1,
+      "country": "UK"
+    },
+    {
+      "name": "University of Cambridge",
+      "aliases": ["cambridge", "university of cambridge"],
+      "tier": 1,
+      "country": "UK"
+    },
+    {
+      "name": "ETH Zurich",
+      "aliases": ["eth zurich", "eth zürich", "eidgenössische technische hochschule"],
+      "tier": 1,
+      "country": "CH"
+    },
+    {
+      "name": "EPFL",
+      "aliases": ["epfl", "ecole polytechnique fédérale de lausanne", "ecole polytechnique federale de lausanne"],
+      "tier": 1,
+      "country": "CH"
+    },
+    {
+      "name": "Imperial College London",
+      "aliases": ["imperial college london", "imperial college"],
+      "tier": 1,
+      "country": "UK"
+    },
+    {
+      "name": "University College London",
+      "aliases": ["university college london", "ucl"],
+      "tier": 1,
+      "country": "UK"
+    },
+    {
+      "name": "Tsinghua University",
+      "aliases": ["tsinghua", "tsinghua university"],
+      "tier": 1,
+      "country": "CN"
+    },
+    {
+      "name": "Peking University",
+      "aliases": ["peking university"],
+      "tier": 1,
+      "country": "CN"
+    },
+    {
+      "name": "Indian Institute of Technology",
+      "aliases": ["indian institute of technology", "iit bombay", "iit delhi", "iit madras", "iit kanpur", "iit kharagpur"],
+      "tier": 1,
+      "country": "IN"
+    },
+    {
+      "name": "National University of Singapore",
+      "aliases": ["national university of singapore", "nus singapore"],
+      "tier": 1,
+      "country": "SG"
+    },
+    {
+      "name": "University of Tokyo",
+      "aliases": ["university of tokyo", "the university of tokyo", "todai"],
+      "tier": 1,
+      "country": "JP"
+    },
+
+    {
+      "name": "UCLA",
+      "aliases": ["ucla", "university of california, los angeles"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "UC San Diego",
+      "aliases": ["ucsd", "uc san diego", "university of california, san diego"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "UC Santa Barbara",
+      "aliases": ["ucsb", "uc santa barbara", "university of california, santa barbara"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "Georgia Tech",
+      "aliases": ["georgia tech", "georgia institute of technology"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "University of Washington",
+      "aliases": ["university of washington", "uw seattle"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "University of Michigan",
+      "aliases": ["university of michigan", "umich", "michigan ann arbor"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "UT Austin",
+      "aliases": ["ut austin", "university of texas at austin", "ut-austin"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "University of Illinois Urbana-Champaign",
+      "aliases": ["uiuc", "illinois urbana", "university of illinois urbana-champaign", "university of illinois at urbana-champaign"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "Purdue University",
+      "aliases": ["purdue", "purdue university"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "Duke University",
+      "aliases": ["duke", "duke university"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "Northwestern University",
+      "aliases": ["northwestern", "northwestern university", "kellogg"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "New York University",
+      "aliases": ["nyu", "new york university", "stern school"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "USC",
+      "aliases": ["usc", "university of southern california"],
+      "tier": 2,
+      "country": "US"
+    },
+    {
+      "name": "University of Toronto",
+      "aliases": ["university of toronto", "u of t toronto"],
+      "tier": 2,
+      "country": "CA"
+    },
+    {
+      "name": "McGill University",
+      "aliases": ["mcgill", "mcgill university"],
+      "tier": 2,
+      "country": "CA"
+    },
+    {
+      "name": "University of Waterloo",
+      "aliases": ["waterloo", "university of waterloo"],
+      "tier": 2,
+      "country": "CA"
+    },
+    {
+      "name": "Technical University of Munich",
+      "aliases": ["tu munich", "technische universität münchen", "technical university of munich", "tum"],
+      "tier": 2,
+      "country": "DE"
+    },
+    {
+      "name": "King's College London",
+      "aliases": ["king's college london", "kings college london", "kcl"],
+      "tier": 2,
+      "country": "UK"
+    },
+    {
+      "name": "University of Edinburgh",
+      "aliases": ["university of edinburgh", "edinburgh university"],
+      "tier": 2,
+      "country": "UK"
+    },
+    {
+      "name": "Tel Aviv University",
+      "aliases": ["tel aviv university", "tau"],
+      "tier": 2,
+      "country": "IL"
+    },
+    {
+      "name": "Technion",
+      "aliases": ["technion", "israel institute of technology"],
+      "tier": 2,
+      "country": "IL"
+    },
+
+    {
+      "name": "University of Wisconsin-Madison",
+      "aliases": ["university of wisconsin-madison", "uw madison", "wisconsin madison"],
+      "tier": 3,
+      "country": "US"
+    },
+    {
+      "name": "Boston University",
+      "aliases": ["boston university", "bu boston"],
+      "tier": 3,
+      "country": "US"
+    },
+    {
+      "name": "Northeastern University",
+      "aliases": ["northeastern university", "northeastern boston"],
+      "tier": 3,
+      "country": "US"
+    },
+    {
+      "name": "University of British Columbia",
+      "aliases": ["university of british columbia", "ubc vancouver"],
+      "tier": 3,
+      "country": "CA"
+    }
+  ]
+}

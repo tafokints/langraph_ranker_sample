@@ -15,13 +15,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 WEIGHTS_SUM_TOLERANCE = 1e-3
 WEIGHTS_FILE_RELATIVE_PATH = "config/weights.json"
 WEIGHTS_BACKUP_RELATIVE_PATH = "config/weights.prev.json"
+WEIGHTS_HISTORY_DIR_RELATIVE_PATH = "config/weights.history"
+HISTORY_FILENAME_REGEX = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<sha>[0-9a-f]{4,40})\.json$"
+)
 
 # Per-dimension gain/bias bounds. The calibrator fits an affine transform
 # `adjusted = gain * raw + bias` per dimension. We constrain the gain to
@@ -55,6 +61,123 @@ def weights_backup_path() -> Path:
     return _project_root() / WEIGHTS_BACKUP_RELATIVE_PATH
 
 
+def weights_history_dir() -> Path:
+    return _project_root() / WEIGHTS_HISTORY_DIR_RELATIVE_PATH
+
+
+def _short_git_sha() -> str:
+    """Return a short git SHA for the working tree, or `'nogit'` when unavailable.
+
+    Used as a tie-breaker in archive filenames so two fits on the same calendar
+    day land in different files. Falls back gracefully when the project isn't
+    in a git working tree (e.g. someone unzipped a release tarball).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(_project_root()),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return "nogit"
+    sha = (result.stdout or "").strip()
+    return sha or "nogit"
+
+
+def archive_weights_snapshot(
+    source_path: Optional[Path] = None,
+    archive_dir: Optional[Path] = None,
+    timestamp: Optional[datetime] = None,
+    short_sha: Optional[str] = None,
+) -> Optional[Path]:
+    """Copy `source_path` into `config/weights.history/<date>_<sha>.json`.
+
+    Returns the archive Path on success, or None if the source doesn't exist
+    (e.g. archive called before any weights were ever saved). Overwrites an
+    existing archive file with the same name without complaining — same date
+    and same git SHA means the same fit attempt, the most recent content is
+    the source of truth.
+    """
+    resolved_source = source_path if source_path is not None else weights_file_path()
+    if not resolved_source.exists():
+        return None
+
+    resolved_archive_dir = archive_dir if archive_dir is not None else weights_history_dir()
+    resolved_archive_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_timestamp = timestamp if timestamp is not None else datetime.now()
+    resolved_sha = short_sha if short_sha is not None else _short_git_sha()
+    archive_filename = f"{resolved_timestamp.strftime('%Y-%m-%d')}_{resolved_sha}.json"
+    archive_path = resolved_archive_dir / archive_filename
+
+    archive_path.write_bytes(resolved_source.read_bytes())
+    return archive_path
+
+
+def list_archived_weights(
+    archive_dir: Optional[Path] = None,
+) -> List[Tuple[datetime, Path]]:
+    """List all archived weights files sorted oldest -> newest.
+
+    Sort key is the ISO date in the filename, then the file mtime as a
+    tie-breaker. Files that don't match `<YYYY-MM-DD>_<sha>.json` are
+    silently skipped — accidental notes etc. shouldn't crash the diff.
+    """
+    resolved_archive_dir = archive_dir if archive_dir is not None else weights_history_dir()
+    if not resolved_archive_dir.exists():
+        return []
+
+    indexed_entries: List[Tuple[datetime, Path]] = []
+    for entry_path in resolved_archive_dir.iterdir():
+        if not entry_path.is_file():
+            continue
+        match = HISTORY_FILENAME_REGEX.match(entry_path.name)
+        if not match:
+            continue
+        try:
+            parsed_date = datetime.strptime(match.group("date"), "%Y-%m-%d")
+        except ValueError:
+            continue
+        indexed_entries.append((parsed_date, entry_path))
+
+    indexed_entries.sort(key=lambda pair: (pair[0], pair[1].stat().st_mtime))
+    return indexed_entries
+
+
+def find_most_recent_archive(
+    exclude_path: Optional[Path] = None,
+    archive_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the most recent archived weights file, optionally excluding one.
+
+    `exclude_path` is useful right after `archive_weights_snapshot` writes
+    today's snapshot — we want the *previous* fit to compare against, not
+    the one we just wrote.
+    """
+    archived_entries = list_archived_weights(archive_dir=archive_dir)
+    if not archived_entries:
+        return None
+
+    if exclude_path is not None:
+        try:
+            resolved_exclude = exclude_path.resolve()
+        except OSError:
+            resolved_exclude = exclude_path
+        archived_entries = [
+            (entry_date, entry_path)
+            for entry_date, entry_path in archived_entries
+            if entry_path.resolve() != resolved_exclude
+        ]
+
+    if not archived_entries:
+        return None
+
+    return archived_entries[-1][1]
+
+
 def _validate_weights_dict(candidate_weights: Dict[str, float], expected_keys: Dict[str, float]) -> None:
     """Assert weights are non-negative, cover every expected key, and sum to ~1."""
     missing_keys = [key for key in expected_keys if key not in candidate_weights]
@@ -72,15 +195,22 @@ def _validate_weights_dict(candidate_weights: Dict[str, float], expected_keys: D
     )
 
 
-def load_weights(defaults: Dict[str, float]) -> Dict[str, float]:
-    """Read `config/weights.json` and return the weight dict.
+def load_weights(
+    defaults: Dict[str, float],
+    path: Optional[Path] = None,
+) -> Dict[str, float]:
+    """Read a weights JSON file and return the weight dict.
 
     Falls back to `defaults` (a caller-owned dict, e.g. DEFAULT_DIMENSION_WEIGHTS)
     when the file is missing, unreadable, malformed, or contains weights that
     fail validation. Never raises; calibration is opt-in and the pipeline must
     keep running without it.
+
+    `path` defaults to `config/weights.json`. The A/B harness passes an
+    arbitrary archived path (e.g. `config/weights.history/2026-04-19.json`)
+    so it can compare two configurations side by side.
     """
-    weights_path = weights_file_path()
+    weights_path = path if path is not None else weights_file_path()
     if not weights_path.exists():
         return dict(defaults)
 
@@ -132,14 +262,20 @@ def _validate_gains_dict(
         )
 
 
-def load_gains(defaults: Dict[str, float]) -> Dict[str, Dict[str, float]]:
-    """Read per-dimension gain/bias from `config/weights.json` if present.
+def load_gains(
+    defaults: Dict[str, float],
+    path: Optional[Path] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Read per-dimension gain/bias from a weights JSON file if present.
 
     Falls back to identity (gain=1.0, bias=0.0) for every dimension key when
     the file is missing, malformed, or has no `gains` block. Never raises, so
     pre-v2 weights files remain usable unchanged.
+
+    `path` defaults to `config/weights.json`; pass an archived history file
+    when running an A/B comparison via `scripts/ab_compare_weights.py`.
     """
-    weights_path = weights_file_path()
+    weights_path = path if path is not None else weights_file_path()
     if not weights_path.exists():
         return default_dimension_gains(defaults)
 
