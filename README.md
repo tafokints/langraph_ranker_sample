@@ -1,106 +1,62 @@
 # LangGraph Recruiter Agent
 
-A portfolio demo showing how to wrap an LLM in a small, explicit graph of
-deterministic steps using [LangGraph](https://github.com/langchain-ai/langgraph).
-Given a free-text role brief, the pipeline parses it into structured filters,
-pulls candidates from a MySQL table of parsed LinkedIn profiles through a
-hybrid (lexical ∪ embedding) retriever, ranks them with an LLM
-(pointwise → listwise rerank → pairwise tie-break), and synthesizes a cited
-shortlist for a hiring manager. The rubric self-improves: human labels feed
-a calibration script that refits per-dimension weights and affine gains.
+A working LangGraph + LangChain ranking pipeline. Given a natural-language
+role brief, it returns a cited shortlist of candidates from a MySQL pool of
+1,000 LinkedIn profiles, with a per-candidate rubric score, an LLM-written
+explanation, a LangSmith trace URL, and a token/cost counter.
+
+The interesting part isn't the demo — it's the architecture: a deterministic
+heuristic floor with **bounded LLM polish** on top, a **calibration loop**
+that fits rubric weights from human labels, and an **ablation harness** that
+quantifies which LLM stages actually move the ranking.
 
 ![Streamlit demo screenshot](docs/streamlit_demo.png)
 
-## Four use cases in one repo
+## What's in here (90-second scan)
 
-This repo reads four different ways on purpose:
-
-1. **Recruiter tooling.** A recruiter drops a natural-language role brief
-   into the Streamlit UI and gets back a ranked, cited shortlist with an
-   inline "this is why" breakdown per candidate. See the
-   [Quickstart](#quickstart) and the Streamlit screenshot above.
-2. **LLM-in-the-loop reference pipeline.** Every LLM call sits behind a
-   deterministic fallback, so a missing `OPENAI_API_KEY`, a transient
-   network error, or a schema-violating response never aborts the run —
-   the graph returns a heuristic result and surfaces the reason in
-   `error_messages`. See the per-node fallback table in
-   [Architecture](#architecture).
-3. **Calibrated rubric loop.** The 5-dimension rubric isn't hand-tuned:
-   [`scripts/calibrate.py`](scripts/calibrate.py) ingests MySQL-stored
-   human labels and solves for per-dimension **weights** (NNLS + simplex
-   projection) and **affine gains** (OLS, per-dimension). The committed
-   v2 fit cut overall MAE from 0.837 → **0.345** on the seed fixture;
-   see the [Calibration loop](#calibration-loop) section for the full
-   before/after table and the bias-vs-weight diagnostic.
-4. **Hybrid retrieval + rerank pattern.** `retrieve_candidates` unions
-   lexical SQL (with LLM-generated role paraphrases) and a FAISS
-   in-process embedding index. `rank_candidates` then runs pointwise
-   scoring → listwise top-K rerank → pairwise tie-break on near-ties.
-   This is the pattern most production recommendation-style pipelines
-   converge on; see [Hybrid retrieval](#hybrid-retrieval-round-2) and
-   the architecture diagram.
+| You're looking for | Open this |
+|---|---|
+| **Architecture** — the graph, the 4 LLM calls, the conditional edge, the state shape | [`docs/architecture.md`](docs/architecture.md) |
+| **Quickstart** — clone → MySQL + OpenAI key → `make run` | [Quickstart](#quickstart) |
+| **LangChain / LangGraph surface area** — every idiom, where it lives, what it buys | [Surface area](#langchain--langgraph-surface-area) |
+| **Calibration loop** — fit rubric weights from human labels with NNLS + simplex projection | [Calibration loop](#calibration-loop) |
+| **Ablation table** — Jaccard@3 per LLM stage on 10 held-out prompts | [Round 4 ablation](#round-4-ablation-which-feature-actually-moves-top-3) |
+| **Iteration playbook** — per-session, weekly, monthly loops with exact commands | [Iteration playbook](#iteration-playbook) |
 
 ## LangChain / LangGraph surface area
 
-Every idiom this demo exercises, in one table, so a reviewer can scan the
-repo in 90 seconds:
+Every idiom this project exercises, in one table:
 
-| Idiom | Where it lives | What it buys you here |
-|-------|---------------|----------------------|
-| `StateGraph` with a `TypedDict` state | [`src/langgraph_app.py`](src/langgraph_app.py) `build_graph()`, [`src/schemas.py`](src/schemas.py) `RecruiterGraphState` | Single source of truth for inter-node data; easy to inspect and test |
-| `llm.with_structured_output(PydanticModel)` | `parse_query_node`, pointwise ranker, listwise reranker, pairwise tie-break | Validated JSON via OpenAI tool-calling; no hand-rolled `json.loads` + try/except |
-| `StateGraph.add_conditional_edges(...)` | `should_enrich` → `enrich_low_info` \| `rank_candidates` | Canonical LangGraph routing; low-info candidates get an extra enrichment pass |
-| Two-stage rank → pairwise tie-break | `_pointwise_rank_with_llm` + `_listwise_rerank_top_k` + `_pairwise_tiebreak_adjacent` | Reference pattern for LLM-scoring pipelines; pairwise adds visible quality lift on near-ties (`< 0.3` gap) with a strict call budget |
-| Evidence-grounded guardrail | `_merge_llm_dimension_ranking` + `DimensionEvidenceModel.dimension_evidence` | Rejects LLM dimension swings > 3.0 that don't quote source text; caps hallucination-driven score jumps |
-| Hybrid retrieval (lexical ∪ FAISS) | [`src/retriever.py`](src/retriever.py) `search_profiles`, [`src/embeddings_index.py`](src/embeddings_index.py) `semantic_search` | LLM-generated `role_paraphrases` union + in-process FAISS inner-product index over `headline + about_text`; cached to `.cache/embeddings.npz` |
-| `@traceable` + LangSmith run URL in UI | All 5 nodes + `run_recruiter_search`; sidebar + top-of-page metrics in [`app.py`](app.py) | One trace tree per run with each node as a child; sidebar links straight to the trace |
-| Token / cost counter via callback handler | `TokenUsageCollector(BaseCallbackHandler)` in [`src/langgraph_app.py`](src/langgraph_app.py) | Surfaces `{llm_calls, total_tokens, estimated_cost_usd}` in the UI without a LangSmith API round-trip |
-| Deterministic fallbacks at every node | Every `*_node` in `src/langgraph_app.py` | Missing API key / validation error / DB miss → graph still returns a useful result with the reason surfaced |
-| Human-in-the-loop calibration harness | [`src/labels_store.py`](src/labels_store.py), [`scripts/calibrate.py`](scripts/calibrate.py), [`config/weights.json`](config/weights.json) | Rubric weights + per-dim affine gains aren't hardcoded — they're fit from MySQL labels (NNLS + simplex, OLS) with MAE-before/after provenance and a bias-vs-weight diagnostic |
+| Idiom | Where it lives | What it buys you |
+|---|---|---|
+| `StateGraph` + `TypedDict` state | [`src/langgraph_app.py`](src/langgraph_app.py) `build_graph()` (~L1591), [`src/schemas.py`](src/schemas.py) `RecruiterGraphState` | Inter-node data flows through one typed dict; nodes are testable in isolation |
+| `add_conditional_edges(...)` | `should_enrich` → `enrich_low_info` \| `rank_candidates` | The reason this is a graph, not a chain — low-recall results route through extra enrichment |
+| `with_structured_output(PydanticModel)` × 4 | `parse_query`, pointwise ranker, listwise reranker, pairwise tie-break | Validated JSON via OpenAI tool-calling; no hand-rolled `json.loads` + try/except in the graph |
+| Three-stage LLM ranking | `_pointwise_rank_with_llm` + `_listwise_rerank_top_k` + `_pairwise_tiebreak_within_window` | Pointwise (always) → listwise rerank top-K → pairwise tie-break on near-ties only, budget-capped at 4 LLM calls |
+| Evidence-grounded LLM guardrail | `_merge_llm_dimension_ranking` + `DimensionEvidenceModel.dimension_evidence` | Rejects LLM dimension swings > 3.0 that don't quote source text — heuristic baseline is the floor |
+| Custom `BaseCallbackHandler` | `TokenUsageCollector` in [`src/langgraph_app.py`](src/langgraph_app.py) | Per-search `{llm_calls, total_tokens, estimated_cost_usd}` surfaced in the UI without a LangSmith API round-trip |
+| `@traceable` + LangSmith trace URL in UI | All 5 nodes + `run_recruiter_search`; sidebar in [`app.py`](app.py) | One nested trace per search; click-through from the UI |
+| Hybrid retrieval (lexical ∪ FAISS) | [`src/retriever.py`](src/retriever.py), [`src/embeddings_index.py`](src/embeddings_index.py) | LLM-generated `role_paraphrases` unioned with in-process FAISS over `text-embedding-3-small`; cached to `.cache/embeddings.npz` |
+| Deterministic fallback at every node | Every `*_node` in [`src/langgraph_app.py`](src/langgraph_app.py) | Missing API key / validation error / DB miss → graph still returns a useful ranking and surfaces the reason in `error_messages` |
+| Human-in-the-loop calibration | [`src/labels_store.py`](src/labels_store.py), [`scripts/calibrate.py`](scripts/calibrate.py), [`config/weights.json`](config/weights.json) | Per-dim `gain`/`bias` (OLS) + aggregate `weights` (NNLS + simplex projection) fit from MySQL labels; every fit archived to `config/weights.history/<date>_<sha>.json` |
+| Runtime config swap for A/B | `weights_override` + `gains_override` + `feature_flags` on `RecruiterGraphState` | Powers [`scripts/ab_compare_weights.py`](scripts/ab_compare_weights.py) and the R4-4 ablation harness without graph rewiring |
 
-## Why this is interesting
-- **LangGraph is the plumbing, not the magic.** Each node has a narrow job so
-  the system is testable and easy to reason about.
-- **LLM + SQL together.** Structured filters from the LLM are passed into
-  parameterized SQL, so ranking only runs over rows that already pass
-  hard constraints.
-- **Graceful degradation.** Every node has a deterministic fallback: no
-  `OPENAI_API_KEY`, no JSON output, no DB match — the graph still returns
-  something meaningful and surfaces the reason in the UI.
-- **Self-improving rubric.** Human labels flow back through
-  `scripts/calibrate.py`, which fits weights and per-dimension gains
-  against them and commits a versioned `config/weights.json`. Not a
-  mechanism that "exists" — a mechanism with committed before/after
-  numbers on a reproducible seed fixture.
-- **Shippable demo surface.** Streamlit front end with parsed filters,
-  ranked candidate cards, a shortlist summary that cites `profile_id`s,
-  starter-prompt chips, a token/cost counter, and a one-click copy of
-  the shortlisted profile IDs.
-
-## Architecture
+## Architecture (one-screen view)
 
 ```mermaid
 flowchart LR
-    userQuery["User query (Streamlit)"] --> parseQuery[parse_query]
-    parseQuery -->|"with_structured_output(ParsedQueryModel)"| retrieveCandidates["retrieve_candidates<br/>(lexical ∪ FAISS)"]
-    retrieveCandidates -->|"any about<200"| enrichLowInfo[enrich_low_info]
-    retrieveCandidates -->|"skip"| rankCandidates["rank_candidates<br/>pointwise → listwise → pairwise"]
+    userQuery["User query<br/>(Streamlit / CLI)"] --> parseQuery["parse_query<br/>with_structured_output(ParsedQueryModel)"]
+    parseQuery --> retrieveCandidates["retrieve_candidates<br/>SQL ∪ FAISS embeddings"]
+    retrieveCandidates -->|"any candidate has<br/>about_text < 200 chars"| enrichLowInfo[enrich_low_info]
+    retrieveCandidates -->|"skip<br/>(no low-info candidates)"| rankCandidates["rank_candidates<br/>pointwise → listwise → pairwise"]
     enrichLowInfo --> rankCandidates
-    rankCandidates --> synthesizeShortlist[synthesize_shortlist]
-    synthesizeShortlist --> uiResult["Shortlist + citations + trace URL + cost"]
+    rankCandidates --> synthesizeShortlist["synthesize_shortlist<br/>cited summary"]
+    synthesizeShortlist --> uiResult["Shortlist + citations<br/>+ trace URL + token cost"]
 ```
 
-| Node | Responsibility | LLM? | Fallback |
-|------|----------------|------|----------|
-| `parse_query` | Extract `ParsedQueryModel` (role, skills, location, must-have, min experience, up to 3 `role_paraphrases`) from free-text brief | Yes (`with_structured_output`) | Heuristic keyword extractor; role brief treated as a single role keyword |
-| `retrieve_candidates` | Hybrid recall: parameterized SQL (one primary query + one per `role_paraphrase`) unioned with FAISS embedding top-K over `headline + about_text` | No (LLM was already used to produce paraphrases upstream) | Auto-relax strict filters when zero rows return; lexical-only if FAISS / OpenAI unavailable |
-| `enrich_low_info` *(conditional)* | For candidates with `about_text < 200` chars, synthesize `about_text_enriched` from `experience_json` + `education_json` | No | Route is skipped when every candidate already has enough `about_text` |
-| `rank_candidates` | Stage-1: per-candidate 5-dimension rubric via `with_structured_output(DimensionRankingResponse)` + match reasons/risks/evidence. Stage-2: listwise rerank of top-5 via `with_structured_output(ListwiseRerankResponse)`. Stage-3: pairwise tie-break on adjacent candidates within 0.3 via `with_structured_output(PairwiseDecision)`, capped to 3 LLM calls per run | Yes | Deterministic per-dimension scorers + pointwise-only ordering; pairwise stage is optional and no-ops when there are no near-ties |
-| `synthesize_shortlist` | Cited hiring-manager-ready summary of top candidates | Yes | Template list with `profile_id` citations |
-
-Implemented in [`src/langgraph_app.py`](src/langgraph_app.py), with types in
-[`src/schemas.py`](src/schemas.py) and DB access in
-[`src/retriever.py`](src/retriever.py).
+For node-by-node contracts, the LangChain idioms used in each, the
+3-stage rank internals, and the calibration / ablation flow diagrams,
+see [`docs/architecture.md`](docs/architecture.md).
 
 ## Data
 
@@ -120,41 +76,39 @@ populating `.env` (see `.env.example`).
 
 ## Quickstart
 
-Requires Python 3.9+ and access to the MySQL table above.
+Requires Python 3.9+ and access to a MySQL instance with the
+`linkedin_api_profiles_parsed` table (schema documented in [Data](#data)).
 
 ```bash
-# 1. Clone + set up
+# 1. Clone + configure secrets
 git clone https://github.com/tafokints/langraph_ranker_sample.git
 cd langraph_ranker_sample
-pip install -r requirements.txt
+cp .env.example .env       # then edit .env with your DB_* values + OPENAI_API_KEY
 
-# 2. Configure secrets
-cp .env.example .env
-# edit .env with your DB_* values and OPENAI_API_KEY
-
-# 3. Verify DB connectivity
-python test_db_connection.py
-
-# 4. Run the Streamlit demo
-streamlit run app.py
+# 2. One-command setup + sanity check + run
+make install               # pip install -r requirements.txt
+make verify                # python test_db_connection.py
+make run                   # streamlit run app.py
 ```
 
-Then open <http://localhost:8501>, type a role brief on the left, and click
-**Run recruiter agent**.
+Then open <http://localhost:8501>, type a role brief, and click **Run
+recruiter agent**.
 
-### CLI mode (no UI)
+`make help` lists every available target (run, smoke test, pytest, calibrate,
+ablation, A/B compare). Don't have `make`? Each target is a single command
+— open the [`Makefile`](Makefile) and copy the line you want.
 
-```bash
-python main.py "Senior technical recruiter hiring ML engineers" --top-k 6
-```
+### Common follow-up commands
 
-### Smoke test (no UI)
-
-```bash
-python scripts/smoke_test.py
-```
-Runs three representative prompts (role-focused, skill-focused,
-location-focused) and prints a PASS/FAIL report.
+| Goal | Command |
+|---|---|
+| One-off CLI search instead of the UI | `make cli SEARCH_QUERY="ML engineer with PhD in SF"` |
+| Run the headless prompt suite | `make smoke` |
+| Run unit + snapshot tests | `make test` |
+| Full sanity sweep before sharing | `make check` (install + verify + test + smoke) |
+| Load the synthetic label fixture (for the calibration demo) | `make seed-labels` |
+| Dry-run the calibrator (read report, don't write weights) | `make calibrate` |
+| Re-generate the ablation table | `make ablation` |
 
 ## Configuration
 
@@ -171,24 +125,42 @@ location-focused) and prints a PASS/FAIL report.
 ## Project layout
 
 ```
-app.py                     Streamlit UI
-main.py                    CLI entrypoint
-test_db_connection.py      Minimal MySQL smoke test
+app.py                       Streamlit UI (search + cards-page labeling)
+main.py                      CLI entrypoint
+test_db_connection.py        Minimal MySQL smoke test
+Makefile                     One-command targets: install / verify / run / test / smoke / calibrate / ablation
 requirements.txt
-scripts/
-  smoke_test.py            Headless end-to-end test across 3 prompts
+pages/
+  2_Label_queue.py           One-at-a-time labeling page (Streamlit multipage)
 src/
-  __init__.py
-  langgraph_app.py         LangGraph: 4 nodes + state + fallbacks
-  retriever.py             Parameterized SQL with structured filters
-  schemas.py               TypedDicts for graph state and parsed query
+  langgraph_app.py           LangGraph: 5 nodes + state + scorers + fallbacks
+  retriever.py               Parameterized SQL with structured filters
+  embeddings_index.py        FAISS in-process embedding index
+  schemas.py                 TypedDicts + Pydantic models for the graph
+  weights_loader.py          Load/save config/weights.json + history archive
+  schools_loader.py          Structured education-prestige lookup over schools.json
+  labels_store.py            MySQL persistence for human labels
+scripts/
+  smoke_test.py              Headless end-to-end test across the prompt fixture
+  calibrate.py               Fit weights + per-dim gain/bias from MySQL labels (NNLS + OLS)
+  ab_compare_weights.py      A/B Jaccard@K diff between two weights configs
+  ablation_table.py          R4-4 5-row ablation table over 10 held-out prompts
+  generate_seed_labels.py    Reproducible synthetic-label fixture generator
+  load_seed_labels.py        Idempotent loader for fixtures/seed_labels.sql
+config/
+  weights.json               Current fitted weights + per-dim gains
+  weights.history/           Archived snapshots, one per fit, tagged by date + git SHA
+  schools.json               Structured tier + program-modifier corpus
+fixtures/
+  smoke_prompts.yml          10 held-out prompts used by smoke + ablation + snapshot tests
+  seed_labels.sql, .json     Reproducible synthetic label fixture (21 rows)
+tests/                       pytest unit + snapshot tests
 docs/
-  streamlit_demo.png       Screenshot used in this README
-.cursor/rules/
-  karpathy-guidelines.mdc  Karpathy-inspired behavioral rules for agents
-.streamlit/
-  config.toml              Local theme + headless defaults
-.env.example               Template for local env vars
+  architecture.md            Full graph diagram + node contracts + LangChain idioms
+  streamlit_demo.png         Screenshot used in this README
+reports/                     Calibration reports, ablation logs, weights drift diffs
+.streamlit/config.toml       Local theme + headless defaults
+.env.example                 Template for local env vars
 ```
 
 ## Ranking rubric (5-dimension scoring)
